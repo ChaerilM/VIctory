@@ -128,14 +128,13 @@ and point `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
 `amd_fidelityfx_upscaler_dx12.dll`. Without it, or if that DLL offers no
 upscaler for your GPU (the log says so), the title's own DLLs run.
 
-Experimental NVIDIA provider integration: `[paths].streamline_dir` (or
-`VICTORY_STREAMLINE_DIR`) can select a separately built
-`victory_streamline_upscaler.dll` implementing our versioned host
-FidelityFX-compatible interface on an NVIDIA GPU. It takes precedence over
-PC FidelityFX if its startup probe succeeds. **This is provider plumbing,
-not a working DLSS implementation.** The stock Streamline DLLs alone are
-not sufficient, and no adapter or NVIDIA binaries are shipped. See
-[the adapter contract and next steps](docs/streamline.md).
+Experimental NVIDIA DLSS Super Resolution: `[paths].streamline_dir` (or
+`VICTORY_STREAMLINE_DIR`) can select the optional NGX adapter built from
+`native/ngx/bridge.cpp` with `scripts/build-ngx.ps1`. It uses direct NGX,
+not Streamline's runtime yet, and takes precedence over PC FidelityFX if
+its startup probe succeeds. No NVIDIA SDK binaries are shipped. The
+prototype has not been validated on Windows/RTX. See
+[build, configuration and limitations](docs/streamline.md).
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived

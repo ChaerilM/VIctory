@@ -50,8 +50,21 @@ pub fn record<R>(
     list: *const Object,
     f: impl FnOnce(&ID3D12GraphicsCommandList) -> R,
 ) -> Option<R> {
+    record_retained(list, None::<()>, f)
+}
+
+/// Keep a native provider lease until the recorded list is reset or dropped.
+/// Install before recording, including if the provider returns an error.
+pub fn record_retained<R, T: Send + 'static>(
+    list: *const Object,
+    keep: Option<T>,
+    f: impl FnOnce(&ID3D12GraphicsCommandList) -> R,
+) -> Option<R> {
     let mut out = None;
     crate::list::with_state(list, |host, state| {
+        if let Some(keep) = keep {
+            host.keep_external(keep);
+        }
         out = Some(f(&host.list));
         state.host_state_lost();
     });

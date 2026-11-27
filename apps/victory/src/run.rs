@@ -62,6 +62,9 @@ pub fn run(
     if let Some(dir) = &cfg.streamline_dir {
         victory_core::ensure_outside_repo(dir)?;
         victory_core::ensure_outside_repo(&dir.join("victory_streamline_upscaler.dll"))?;
+        if let Some(data) = std::env::var_os("VICTORY_NGX_DATA_DIR").filter(|v| !v.is_empty()) {
+            victory_core::ensure_outside_repo(std::path::Path::new(&data))?;
+        }
     }
     // Choose exactly one host provider before the import registry is used.
     victory_hle::modules::fidelityfx::use_host_dirs(

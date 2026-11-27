@@ -1,13 +1,29 @@
-# Optional NVIDIA upscaler provider (phase 1)
+# Experimental NVIDIA DLSS Super Resolution (direct NGX)
 
-VIctory intercepts the title's Xbox FidelityFX API and supplies native
-D3D12 objects to a PC provider. This change adds an optional, versioned
-provider slot for a future NVIDIA adapter. It does not initialize Streamline,
-call NGX, or execute DLSS itself.
+This optional, locally built provider translates the console FidelityFX
+upscaling API to native NVIDIA NGX DLSS Super Resolution. It keeps
+`streamline_dir` and the adapter filename from phase 1 for compatibility;
+it does not yet call Streamline. No SDK files or native binaries are
+committed, and no SDK dependency is added to Cargo.
 
-## Configuration
+## Build locally
 
-In your own git-ignored `victory.toml`:
+Obtain the [official DLSS SDK](https://github.com/NVIDIA/DLSS) outside the
+repo and review its [license](https://github.com/NVIDIA/DLSS/blob/main/LICENSE.txt).
+From an x64 Visual Studio Developer PowerShell:
+
+```powershell
+.\scripts\build-ngx.ps1 -SdkDir D:\SDKs\DLSS -OutputDir D:\victory-data\streamline
+cargo build --release -p victory
+```
+
+The script uses the SDK's Windows x64 headers and MD-runtime library
+and copies its release feature DLL to the local output directory.
+Do not commit or distribute the resulting DLLs without reviewing SDK
+and GPL licensing compatibility and any applicable permissions.
+The script checks the stated folder layout; it is untested on Windows.
+
+Configure your private `victory.toml`:
 
 ```toml
 [paths]
@@ -15,101 +31,74 @@ fidelityfx_dir = 'D:\victory-data\fidelityfx'
 streamline_dir = 'D:\victory-data\streamline'
 ```
 
-The equivalent override is `VICTORY_STREAMLINE_DIR`. Like the other
-path settings, an empty environment value is ignored. Omit the path to
-keep the old behavior. Keep all SDK files and user-built DLLs outside the
-repository. `victory config` reports the configured folder.
+Set the environment variables for your own development project and local
+SDK log/data storage outside the repo (use a project UUID you control,
+not one belonging to another application):
 
-The NVIDIA folder must contain a user-built
-`victory_streamline_upscaler.dll`. **No such DLL is shipped or built by
-this PR.** A directory containing only the official Streamline SDK
-(`sl.interposer.dll`, `sl.dlss.dll`, `nvngx_dlss.dll`) does not implement
-the provider ABI. Do not rename those files to the adapter name.
+```powershell
+$env:VICTORY_NGX_PROJECT_ID = '<your-project-uuid>'
+$env:VICTORY_NGX_DATA_DIR = 'D:\victory-data\ngx-data'
+```
 
-Selection is once at startup, before imports bind:
+A UUID may be generated once for a local project with
+`[guid]::NewGuid().ToString()`; keep it stable. A valid ID does not
+guarantee NVIDIA service approval or feature availability. The SDK may
+perform its own updates as specified in its license.
 
-1. Explicitly configured Streamline adapter, only if the actual host D3D12
-   adapter is NVIDIA (PCI vendor ID 0x10de), ABI matches and provider query
-   reports a usable upscaler.
-2. The existing PC FidelityFX provider, if configured and supported.
-3. The title's original FidelityFX DLLs.
+`VICTORY_STREAMLINE_DIR` overrides the TOML path. Use trusted local DLLs.
+At startup the HLE tries an NVIDIA provider on the actual NVIDIA D3D12
+device, then the configured PC FidelityFX provider, then the original
+console API. If the provider is selected but later fails to create or
+evaluate a feature, restart without its path; no mid-context fallback is
+implemented. The raw Streamline SDK DLLs alone are not an adapter.
 
-A successful selection is not a promise that every context or dispatch will
-succeed. No mid-frame retry, context switching or fallback after recording
-GPU work. If the experimental adapter fails after startup, remove its path
-and restart with the normal provider. Use only trusted DLLs: they execute
-native code in VIctory's process. DLL lookup is absolute and dependency
-search uses the DLL folder and System32.
+## Implementation
 
-## Adapter contract (Windows x64, ABI 1)
-
-An independently developed adapter exports these C-callable symbols,
-using the PC FidelityFX SDK's types and calling conventions:
-
-- `uint32_t victoryStreamlineBridgeAbi(void)`: returns 1.
-- `ffxCreateContext`, `ffxDestroyContext`, `ffxConfigure`, `ffxQuery`,
-  `ffxDispatch`: PC FidelityFX-compatible exports, as used in
-  `crates/victory-hle/src/modules/fidelityfx.rs`.
-
-The adapter must support the context-free GetVersions query (type 4,
-create type 0x10000), including the count-only and names queries on the
-actual D3D12 device. It must report zero versions or an error if it cannot
-serve the device, driver or SDK configuration. Return static NUL-terminated
-names and respect supplied array capacity. A failed startup probe must leave
-no pending GPU work, callbacks or background threads: VIctory can unload
-the DLL. Successful provider code stays loaded for the process lifetime.
-
-The title's create chain carries flags, max render/output sizes, device
-and API version; the existing HLE substitutes the PC device descriptor.
-The dispatch is the PC layout with native command list, native D3D12
-textures (color, depth, motion vectors, exposure, reactive mask,
-transparency mask and output), jitter, motion scale, render/output sizes,
-sharpening, frame delta, pre-exposure, reset, camera near/far/FOV,
-view-space scale and flags. Use the actual SDK headers and verify layouts
-against the Rust compile-time assertions; do not reinterpret Streamline's
-C++ ABI as this ABI. The HLE logs first-dispatch metadata for integration
-diagnostics, not image data.
-
-The adapter must implement the FidelityFX queries/configure operations the
-title uses (including jitter phase/offset and memory/provider queries).
-Do not return success without having produced the requested output.
-Leave all textures in their declared states after recording; VIctory
-restores its own bound heaps, pipeline and root signatures before its next
-draw. The adapter must respect resources and context lifetimes until the
-GPU has completed their last use, including work recorded but not yet
-submitted. This needs a verified submission/retirement integration before
-real DLSS evaluation is enabled.
-
-## Next implementation milestone
-
-- Direct NGX DLSS Super Resolution is a possible narrower prototype:
-  [official SDK](https://github.com/NVIDIA/DLSS) and
-  [NGX guide](https://docs.nvidia.com/ngx/programming-guide/index.html).
-- Streamline is the longer-term framework:
-  [DLSS guide](https://github.com/NVIDIA-RTX/Streamline/blob/main/docs/ProgrammingGuideDLSS.md),
-  [manual integration](https://github.com/NVIDIA-RTX/Streamline/blob/main/docs/ProgrammingGuideManualHooking.md).
-  Its camera matrices, frame tokens, resource tags, device registration
-  and shutdown/retirement need integration. Camera matrices are not in
-  the current FidelityFX dispatch; do not fabricate them.
-- Validate inverted depth, motion vector scale/sign, exposure, jitter,
-  texture formats and output dimensions on a moving scene. The upscaler
-  consumes the game's existing render dimensions; it cannot independently
-  lower internal rendering resolution.
-- Frame generation and Reflex require presentation/latency integration
-  and remain out of scope.
-
-No NVIDIA SDK files, headers or binaries are vendored. The project's GPL
-license and the SDK license/redistribution terms need review before shipping
-a real adapter. See [DLSS license](https://github.com/NVIDIA/DLSS/blob/main/LICENSE.txt)
-and the Streamline repository's license and third-party notices.
+- ABI 2 requires five PC FidelityFX-compatible calls, the existing version
+  marker and explicit retain/release exports. ABI 1 is intentionally
+  rejected so recorded GPU work cannot outlive its adapter context.
+- The context owns NGX parameters and the feature handle. Initialization
+  uses an independent direct list and waits for a fence. HLE retains
+  context references on recorded host lists, including on dispatch error,
+  until reset or destruction after queued use.
+- Feature creation queries NGX capability and optimal-settings ranges
+  for the actual dimensions. It does not force a lower render size.
+- Dispatch maps native color/depth/motion/output, exposure, jitter,
+  motion-vector scale, frame time and reset; validates dimensions and
+  states. Combined SRV state is converted and restored around evaluation.
+- HDR, inverted depth, auto exposure and motion-vector flags are mapped.
+  Unknown flags, unsupported queries and unsupported configurations are
+  rejected rather than pretending they ran.
+- FSR quality-ratio and Halton jitter queries keep familiar semantics.
+  Memory query uses SDK statistics (process total, not per-context).
+  FSR reactive and composition masks, sharpening, frame generation and
+  Reflex are not implemented. No fabricated camera matrices.
 
 ## Validation
 
-Run `cargo test -p victory-core streamline_path` and
-`cargo test -p victory-hle fidelityfx` (Windows for HLE), and the
-existing FidelityFX integration fixture with a supported PC DLL:
-`cargo test -p victory-hle --test fidelityfx`.
-Test an unset path, an empty folder, a wrong ABI, a valid adapter reporting
-zero versions, and a supported adapter. With the first four, verify
-FidelityFX fallback if configured. No NVIDIA adapter or hardware test
-has been run by this change.
+The adapter has not been compiled or run on Windows. It remains a draft
+prototype. Run the existing synthetic GPU readback fixture with the
+adapter explicitly selected, which refuses silent fallback:
+
+```powershell
+$env:VICTORY_TEST_NGX = '1'
+$env:VICTORY_STREAMLINE_DIR = 'D:\victory-data\streamline'
+cargo test -p victory-hle --test fidelityfx -- --nocapture
+```
+
+Set the NGX project and data variables above first. The fixture records
+two upscales, releases title ownership before submission for NGX, checks
+the output and D3D12 validation messages. Run again with the flag removed
+and a supported PC FidelityFX SDK to verify the baseline. A failed fixture
+is a blocker, not evidence of compatibility.
+
+Before enabling for normal use, test moving scenes, jitter sign,
+motion-vector scale and history reset, render-size changes, queue/list
+ordering and repeat submissions, resource format support and context
+retirement. NGX internal synchronization and parameter lifetime across
+multiple recorded lists remain unverified. Compare actual frame times
+with the same rendering dimensions. No speedup is promised.
+
+Streamline and additional features remain future work. See the
+[NGX programming guide](https://docs.nvidia.com/ngx/programming-guide/index.html)
+and [Streamline SDK](https://github.com/NVIDIA-RTX/Streamline).

@@ -1,7 +1,6 @@
-//! The host's FidelityFX through our entry points, called as Grand Theft
-//! Auto VI calls the console's: the title's descriptions, console objects,
-//! one upscaling of a flat colour, the output read back. Needs the PC build
-//! (`VICTORY_FIDELITYFX_DIR`) and a host GPU; skipped without them.
+//! Synthetic flat-color upscaling through the console API interception,
+//! native resources and output readback. Defaults to PC FidelityFX.
+//! Opt-in NGX fixture: VICTORY_TEST_NGX=1 and VICTORY_STREAMLINE_DIR.
 #![cfg(windows)]
 
 use std::ffi::c_void;
@@ -157,8 +156,11 @@ fn half(bits: u16) -> f32 {
 
 #[test]
 fn the_titles_upscaler_runs_on_the_host() {
-    let Some(dir) = std::env::var_os("VICTORY_FIDELITYFX_DIR") else {
-        eprintln!("VICTORY_FIDELITYFX_DIR not set; skipped");
+    let ngx = std::env::var("VICTORY_TEST_NGX").as_deref() == Ok("1");
+    let key = if ngx { "VICTORY_STREAMLINE_DIR" } else { "VICTORY_FIDELITYFX_DIR" };
+    let Some(dir) = std::env::var_os(key) else {
+        assert!(!ngx, "{key} required for explicit NGX test");
+        eprintln!("{key} not set; skipped");
         return;
     };
     // The debug layer, before anything makes the host device: it checks
@@ -170,8 +172,14 @@ fn the_titles_upscaler_runs_on_the_host() {
             debug.iter().for_each(|d| d.EnableDebugLayer());
         }
     }
-    victory_hle::modules::fidelityfx::use_host_dir(Some(std::path::Path::new(&dir)));
+    let dir = std::path::Path::new(&dir);
+    if ngx {
+        victory_hle::modules::fidelityfx::use_host_dirs(Some(dir), None);
+    } else {
+        victory_hle::modules::fidelityfx::use_host_dir(Some(dir));
+    }
     let Some(host) = victory_gpu::external::host_device() else {
+        assert!(!ngx, "explicit NGX test requires host GPU");
         eprintln!("no host GPU; skipped");
         return;
     };
@@ -280,7 +288,7 @@ fn the_titles_upscaler_runs_on_the_host() {
         );
         out
     };
-    // The title's sizes on Series S (FSR 4 wrote zeros at 64x64 to 128x128).
+    // Exercise a realistic synthetic 720p to 1080p upscale.
     let (render, output) = ([1280u32, 720], [1920u32, 1080]);
     let at = |size: [u32; 2], format, flags| make(texture(size[0].into(), size[1], format, flags));
     let target = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
@@ -447,10 +455,20 @@ fn the_titles_upscaler_runs_on_the_host() {
     eprintln!("provider {:#x} {:?}", provider.id, unsafe {
         std::ffi::CStr::from_ptr(provider.name)
     });
-    // Two frames: the first resets the history.
+    if ngx {
+        assert_eq!(provider.id, 0x564943544e475802, "expected NGX, not fallback");
+    }
+    // Two dispatches: the first resets the history.
     for reset in [1, 0] {
         upscaling.reset = reset;
         assert_eq!(dispatch(&mut context, &mut upscaling.header), 0);
+    }
+
+    // For the NGX provider, drop the title's ownership before submission.
+    // The host list's retained context must keep GPU objects alive.
+    if ngx {
+        assert_eq!(destroy(&mut context, null()), 0);
+        assert!(context.is_null());
     }
 
     // Read the output back in the same list, run it as the title would.
@@ -564,5 +582,7 @@ fn the_titles_upscaler_runs_on_the_host() {
             );
         }
     }
-    assert_eq!(destroy(&mut context, null()), 0);
+    if !ngx {
+        assert_eq!(destroy(&mut context, null()), 0);
+    }
 }
