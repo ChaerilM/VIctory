@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -624,6 +624,47 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn gpu_upload_reservations_never_exceed_the_cap() {
+        let bytes = AtomicU64::new(0);
+        assert!(reserve_upload_bytes(&bytes, 64, 128));
+        assert!(!reserve_upload_bytes(&bytes, 65, 128));
+        assert!(reserve_upload_bytes(&bytes, 64, 128));
+        assert!(!reserve_upload_bytes(&bytes, 1, 128));
+        bytes.fetch_sub(64, Ordering::Relaxed);
+        assert!(reserve_upload_bytes(&bytes, 32, 128));
+        assert_eq!(bytes.load(Ordering::Relaxed), 96);
+        assert!(!reserve_upload_bytes(&bytes, u64::MAX, u64::MAX));
+        assert!(gpu_upload_has_room(700.0, 1000.0, 50_000_000));
+        assert!(!gpu_upload_has_room(790.0, 1000.0, 50_000_000));
+        assert!(!gpu_upload_has_room(0.0, 0.0, 1));
+    }
+
+    /// A CPU-filled GPU upload buffer can be read by the GPU with its
+    /// ordinary GENERIC_READ state. Read back only through a readback heap.
+    #[test]
+    fn gpu_upload_scratch_readback_matches_written_bytes() {
+        let Some(host) = host() else { return };
+        if !host.gpu_upload_supported() {
+            eprintln!("GPU upload heaps unsupported; skipping hardware fixture");
+            return;
+        }
+        let size = 64 << 10;
+        let (upload, data) = host.mapped_buffer_kind(size, D3D12_HEAP_TYPE_GPU_UPLOAD)
+            .expect("supported GPU upload heap");
+        let (readback, out) = host.mapped_buffer(size, true).expect("readback heap");
+        let expected: Vec<u8> = (0..size).map(|i| (i.wrapping_mul(31) ^ (i >> 8)) as u8).collect();
+        copy_mapped(data, expected.as_ptr(), expected.len(), false);
+        let list = host.new_list().unwrap();
+        // SAFETY: live buffers in GENERIC_READ and COPY_DEST, valid ranges.
+        unsafe { list.list.CopyBufferRegion(&readback, 0, &upload, 0, size) };
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: GPU finished; mapped readback of the tested range.
+        let actual = unsafe { std::slice::from_raw_parts(out, size as usize) };
+        assert_eq!(actual, expected.as_slice());
+    }
+
+    #[test]
     fn scratch_spare_is_bounded_and_uses_best_fit() {
         let mut spare = ScratchSpare::new();
         assert_eq!(spare.give(64, 1, 512), None);
@@ -990,6 +1031,54 @@ struct ScratchChunk {
     mapped: usize,
     gpu: u64,
     capacity: u64,
+    // Drop after the resource; pooled and asynchronously released chunks
+    // remain charged to the GPU upload budget until they are destroyed.
+    _gpu_upload: Option<GpuUploadReservation>,
+}
+
+/// Live scratch chunks in GPU upload heaps, including spare chunks.
+static GPU_UPLOAD_SCRATCH_BYTES: AtomicU64 = AtomicU64::new(0);
+
+fn gpu_upload_scratch_limit() -> u64 {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let mib = std::env::var("VICTORY_GPU_UPLOAD_SCRATCH_MB").ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v <= 1024)
+            .unwrap_or(0);
+        if mib != 0 {
+            tracing::info!(mib, "experimental GPU upload scratch budget");
+        }
+        mib << 20
+    })
+}
+
+/// Atomically reserve without ever exceeding the configured logical cap.
+fn reserve_upload_bytes(counter: &AtomicU64, size: u64, cap: u64) -> bool {
+    counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+        used.checked_add(size).filter(|&next| next <= cap)
+    }).is_ok()
+}
+
+struct GpuUploadReservation(u64);
+
+impl GpuUploadReservation {
+    fn take(size: u64, cap: u64) -> Option<Self> {
+        reserve_upload_bytes(&GPU_UPLOAD_SCRATCH_BYTES, size, cap).then(|| Self(size))
+    }
+}
+
+impl Drop for GpuUploadReservation {
+    fn drop(&mut self) {
+        GPU_UPLOAD_SCRATCH_BYTES.fetch_sub(self.0, Ordering::Relaxed);
+    }
+}
+
+/// GPU upload allocation is optional, and the DXGI budget is advisory.
+/// Keep at least 20% of the current local budget free at admission.
+fn gpu_upload_has_room(used_mb: f64, budget_mb: f64, size: u64) -> bool {
+    budget_mb > 0.0 && used_mb >= 0.0
+        && used_mb + size as f64 / 1e6 <= budget_mb * 0.80
 }
 
 /// Free scratch chunks shared by command lists. Only returned after a
@@ -2309,14 +2398,20 @@ impl HostList {
             let chunk = match kept {
                 Some(chunk) => chunk,
                 None => {
-                    let (buffer, data) = host.upload_buffer(capacity)?;
+                    let (buffer, data, gpu_upload) = match host.gpu_upload_scratch(capacity) {
+                        Some((buffer, data, reservation)) => (buffer, data, Some(reservation)),
+                        None => {
+                            let (buffer, data) = host.upload_buffer(capacity)?;
+                            (buffer, data, None)
+                        }
+                    };
                     name(&buffer, || format!("list scratch {capacity:#x}"));
                     // SAFETY: a live buffer.
                     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
                     #[cfg(feature = "diagnostics")]
                     tracing::debug!(target: "victory_gpu::scratch", list = ?std::ptr::from_ref(self),
                         chunk = s.current, requested = len, capacity, "allocated list scratch");
-                    ScratchChunk { _buffer: buffer, mapped: data as usize, gpu, capacity }
+                    ScratchChunk { _buffer: buffer, mapped: data as usize, gpu, capacity, _gpu_upload: gpu_upload }
                 }
             };
             s.chunks.push(chunk);
@@ -2829,8 +2924,51 @@ impl Host {
     /// A mapped buffer of `size` bytes: upload memory, or (`readback`)
     /// readback memory in the copy-destination state.
     fn mapped_buffer(&self, size: u64, readback: bool) -> Option<(ID3D12Resource, *mut u8)> {
+        self.mapped_buffer_kind(size, if readback { D3D12_HEAP_TYPE_READBACK } else { D3D12_HEAP_TYPE_UPLOAD })
+    }
+
+    /// Only CPU-written, GPU-read scratch chunks may take this path.
+    /// Title copies, readback, UAVs and oversized dedicated uploads stay
+    /// on their existing heaps.
+    fn gpu_upload_scratch(&self, size: u64) -> Option<(ID3D12Resource, *mut u8, GpuUploadReservation)> {
+        let cap = gpu_upload_scratch_limit();
+        if cap == 0 || size > cap || !self.gpu_upload_supported() {
+            return None;
+        }
+        // Chunk capacities are 64 KiB multiples. Reserve before asking the
+        // driver so concurrent command-list recordings share one cap.
+        let reservation = GpuUploadReservation::take(size, cap)?;
+        let [(used, budget), _] = video_memory()?;
+        if !gpu_upload_has_room(used, budget, size) {
+            return None;
+        }
+        let (buffer, data) = self.mapped_buffer_kind(size, D3D12_HEAP_TYPE_GPU_UPLOAD)?;
+        tracing::debug!(size, live = GPU_UPLOAD_SCRATCH_BYTES.load(Ordering::Relaxed),
+            "GPU upload scratch chunk allocated");
+        Some((buffer, data, reservation))
+    }
+
+    fn gpu_upload_supported(&self) -> bool {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: the feature, data type and size agree.
+            let supported = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }.is_ok() && options.GPUUploadHeapSupported.as_bool();
+            tracing::info!(supported, "GPU upload heaps for command-list scratch");
+            supported
+        })
+    }
+
+    fn mapped_buffer_kind(&self, size: u64, kind: D3D12_HEAP_TYPE) -> Option<(ID3D12Resource, *mut u8)> {
+        let readback = kind == D3D12_HEAP_TYPE_READBACK;
         let heap = D3D12_HEAP_PROPERTIES {
-            Type: if readback { D3D12_HEAP_TYPE_READBACK } else { D3D12_HEAP_TYPE_UPLOAD },
+            Type: kind,
             ..Default::default()
         };
         let desc = D3D12_RESOURCE_DESC {
