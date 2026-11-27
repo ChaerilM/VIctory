@@ -14,6 +14,11 @@
 //! through unchanged: sizes, flags, jitter, motion-vector scale, camera
 //! values, the resource descriptions, the context. Only the upscaler: other
 //! effects (frame generation) are refused.
+//!
+//! An explicitly configured, externally built Streamline adapter may also
+//! implement this same host ABI. It is selected once before imports bind,
+//! never by swapping opaque contexts or after GPU work has been recorded.
+//! The adapter is not part of this crate; see docs/streamline.md.
 #![allow(non_snake_case)]
 // Title code calls these through its import table.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -31,6 +36,23 @@ use crate::{HleModule, hle_export};
 
 /// The PC build's upscaler, which has the five functions itself.
 const DLL: &str = "amd_fidelityfx_upscaler_dx12.dll";
+const STREAMLINE_DLL: &str = "victory_streamline_upscaler.dll";
+const STREAMLINE_ABI: u32 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Provider {
+    Streamline,
+    FidelityFx,
+}
+
+impl Provider {
+    fn dll(self) -> &'static str {
+        match self {
+            Self::Streamline => STREAMLINE_DLL,
+            Self::FidelityFx => DLL,
+        }
+    }
+}
 
 // Return codes.
 const OK: u32 = 0;
@@ -93,7 +115,20 @@ struct DispatchUpscale {
     header: Header,
     list: *mut c_void,
     resources: [Resource; 7],
-    rest: [u32; 18],
+    jitter: [f32; 2],
+    motion_scale: [f32; 2],
+    render: [u32; 2],
+    output: [u32; 2],
+    sharpen: u32,
+    sharpness: f32,
+    frame_ms: f32,
+    pre_exposure: f32,
+    reset: u32,
+    near: f32,
+    far: f32,
+    fov: f32,
+    meters: f32,
+    flags: u32,
 }
 
 const _: () = assert!(size_of::<CreateUpscale>() == 0x30);
@@ -123,7 +158,20 @@ type Destroy = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> u32;
 /// Configure, query and dispatch.
 type Call = unsafe extern "C" fn(*mut *mut c_void, *mut Header) -> u32;
 
+// Keep loaded code alive for all contexts and recorded work. On a failed
+// probe, the provider must have left no device work or background threads.
+struct Module(windows_sys::Win32::Foundation::HMODULE);
+
+impl Drop for Module {
+    fn drop(&mut self) {
+        // SAFETY: our reference from LoadLibraryExW.
+        unsafe { windows_sys::Win32::Foundation::FreeLibrary(self.0) };
+    }
+}
+
 struct Host {
+    _module: Module,
+    provider: Provider,
     create: Create,
     destroy: Destroy,
     configure: Call,
@@ -146,27 +194,39 @@ macro_rules! once {
     }};
 }
 
-/// Serves the title's FidelityFX calls with the PC upscaler in `dir`
-/// (`VICTORY_FIDELITYFX_DIR`) if it offers one for the host GPU; else the
-/// title's own DLLs run. Call once, before the import registry is first
-/// used: it holds this module only when serving.
+/// Preserve the original entry point for callers that only use FidelityFX.
 pub fn use_host_dir(dir: Option<&Path>) {
-    let Some(dir) = dir else {
-        tracing::info!(
-            "no FidelityFX folder (VICTORY_FIDELITYFX_DIR): a title's own FidelityFX DLLs run"
-        );
+    use_host_dirs(None, dir);
+}
+
+/// An external Streamline adapter, if explicitly configured and capable,
+/// then PC FidelityFX, then the title's own DLLs. Only startup failures
+/// trigger fallback: contexts and recorded commands cannot be transferred.
+pub fn use_host_dirs(streamline: Option<&Path>, fidelityfx: Option<&Path>) {
+    if HOST.get().is_some() {
         return;
-    };
-    match load(dir) {
-        Ok((host, versions)) => {
-            tracing::info!(folder = %dir.display(), versions, "FidelityFX: the host's upscaler serves the title's");
-            let _ = HOST.set(host);
-        }
-        Err(why) => tracing::warn!(
-            folder = %dir.display(),
-            "FidelityFX: {why}; the title's own DLLs run"
-        ),
     }
+    if let Some((provider, (host, versions))) = select_provider(streamline, fidelityfx, load) {
+        tracing::info!(?provider, versions, "host upscaler serves the title's FidelityFX API");
+        let _ = HOST.set(host);
+    } else {
+        tracing::info!("no host upscaler selected; the title's own FidelityFX DLLs run");
+    }
+}
+
+fn select_provider<T>(
+    streamline: Option<&Path>,
+    fidelityfx: Option<&Path>,
+    mut load: impl FnMut(&Path, Provider) -> Result<T, String>,
+) -> Option<(Provider, T)> {
+    for (provider, dir) in [(Provider::Streamline, streamline), (Provider::FidelityFx, fidelityfx)] {
+        let Some(dir) = dir else { continue };
+        match load(dir, provider) {
+            Ok(loaded) => return Some((provider, loaded)),
+            Err(why) => tracing::warn!(?provider, folder = %dir.display(), %why, "host upscaler unavailable"),
+        }
+    }
+    None
 }
 
 /// Whether the host's FidelityFX serves the title's.
@@ -174,16 +234,23 @@ pub(crate) fn serving() -> bool {
     HOST.get().is_some()
 }
 
-fn load(dir: &Path) -> Result<(Host, String), String> {
+fn load(dir: &Path, provider: Provider) -> Result<(Host, String), String> {
+    let dll = provider.dll();
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::System::LibraryLoader::{
         GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
         LoadLibraryExW,
     };
     // The search flags below want a full path.
-    let path = std::path::absolute(dir.join(DLL)).map_err(|e| e.to_string())?;
+    let path = std::path::absolute(dir.join(dll)).map_err(|e| e.to_string())?;
     if !path.is_file() {
-        return Err(format!("no {DLL} there"));
+        return Err(format!("no {dll} there"));
+    }
+    let device = victory_gpu::external::host_device().ok_or("there is no host GPU")?;
+    if provider == Provider::Streamline
+        && victory_gpu::external::host_vendor_id(&device) != Some(0x10de)
+    {
+        return Err("Streamline adapter requires an NVIDIA host GPU".into());
     }
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
     // Its own folder and System32 only, never the current folder.
@@ -192,20 +259,33 @@ fn load(dir: &Path) -> Result<(Host, String), String> {
     let module = unsafe { LoadLibraryExW(wide.as_ptr(), null_mut(), search) };
     if module.is_null() {
         return Err(format!(
-            "{DLL} did not load ({})",
+            "{dll} did not load ({})",
             std::io::Error::last_os_error()
         ));
     }
+    let module_guard = Module(module);
     let find = |name: &CStr| {
         // SAFETY: a loaded module and a NUL-terminated name.
         unsafe { GetProcAddress(module, name.as_ptr().cast()) }
             .map(|f| f as *const c_void)
-            .ok_or_else(|| format!("{DLL} has no {}", name.to_string_lossy()))
+            .ok_or_else(|| format!("{dll} has no {}", name.to_string_lossy()))
     };
-    let device = victory_gpu::external::host_device().ok_or("there is no host GPU")?;
+    if provider == Provider::Streamline {
+        // SAFETY: explicitly configured adapter's versioned entry point.
+        let abi = unsafe {
+            std::mem::transmute::<*const c_void, unsafe extern "C" fn() -> u32>(
+                find(c"victoryStreamlineBridgeAbi")?,
+            )()
+        };
+        if abi != STREAMLINE_ABI {
+            return Err(format!("unsupported Streamline adapter ABI {abi}, expected {STREAMLINE_ABI}"));
+        }
+    }
     // SAFETY: the API's exports, with its signatures.
     let host = unsafe {
         Host {
+            _module: module_guard,
+            provider,
             create: std::mem::transmute::<*const c_void, Create>(find(c"ffxCreateContext")?),
             destroy: std::mem::transmute::<*const c_void, Destroy>(find(c"ffxDestroyContext")?),
             configure: std::mem::transmute::<*const c_void, Call>(find(c"ffxConfigure")?),
@@ -235,7 +315,7 @@ fn versions(host: &Host) -> Result<String, String> {
     };
     // SAFETY: a version query naming the host device.
     let code = unsafe { (host.query)(null_mut(), &mut query.header) };
-    if code != OK || count == 0 {
+    if code != OK || count == 0 || count > 256 {
         return Err(format!(
             "it offers no upscaler for the host GPU (code {code})"
         ));
@@ -243,9 +323,13 @@ fn versions(host: &Host) -> Result<String, String> {
     let mut names = vec![null::<c_char>(); count as usize];
     query.names = names.as_mut_ptr();
     // SAFETY: as above, with room for `count` names.
-    unsafe { (host.query)(null_mut(), &mut query.header) };
+    let code = unsafe { (host.query)(null_mut(), &mut query.header) };
+    if code != OK || count == 0 || count as usize > names.len() {
+        return Err(format!("provider version enumeration failed (code {code})"));
+    }
     Ok(names
         .iter()
+        .take(count as usize)
         .filter(|n| !n.is_null())
         // SAFETY: NUL-terminated names the DLL keeps.
         .map(|&n| unsafe { CStr::from_ptr(n) }.to_string_lossy().into_owned())
@@ -337,6 +421,7 @@ extern "C" fn ffxCreateContext(
     let name = (!version.name.is_null())
         .then(|| unsafe { CStr::from_ptr(version.name) }.to_string_lossy());
     tracing::info!(
+        backend = ?host.provider,
         provider = name.as_deref().unwrap_or("?"),
         id = format_args!("{:#x}", version.id),
         render = ?upscale.max_render,
@@ -402,6 +487,12 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     // SAFETY: an upscaling, by its type.
     let mut dispatch = unsafe { desc.cast::<DispatchUpscale>().read() };
     let list = dispatch.list.cast::<Object>().cast_const();
+    once!(info, backend = ?host.provider, render = ?dispatch.render, output = ?dispatch.output,
+        jitter = ?dispatch.jitter, motion_scale = ?dispatch.motion_scale,
+        frame_ms = dispatch.frame_ms, pre_exposure = dispatch.pre_exposure,
+        reset = dispatch.reset, near = dispatch.near, far = dispatch.far, fov = dispatch.fov,
+        flags = dispatch.flags, resources = ?dispatch.resources.map(|r| (!r.resource.is_null(), r.description, r.state)),
+        "FidelityFX: first dispatch metadata (no texture contents)");
     // Alive for the call (the list holds them too).
     let mut textures = Vec::new();
     for r in dispatch
@@ -496,7 +587,8 @@ mod tests {
     #[test]
     fn without_the_dll_the_titles_own_runs() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load(dir.path()).err().unwrap().contains(DLL));
+        assert!(load(dir.path(), Provider::FidelityFx).err().unwrap().contains(DLL));
+        assert!(load(dir.path(), Provider::Streamline).err().unwrap().contains(STREAMLINE_DLL));
         assert!(!serving());
         let symbol = victory_pe::ImportSymbol::Name {
             hint: 0,
@@ -507,6 +599,33 @@ mod tests {
             resolver.classify("amd_fidelityfx_loader_xbox.dll", &symbol),
             None
         );
+    }
+
+    #[test]
+    fn provider_selection_prefers_opt_in_streamline_and_falls_back_at_startup() {
+        let sl = Path::new("sl");
+        let fsr = Path::new("fsr");
+        let mut attempted = Vec::new();
+        let selected = select_provider(Some(sl), Some(fsr), |dir, provider| {
+            attempted.push((dir.to_path_buf(), provider));
+            if provider == Provider::Streamline { Err("unsupported".into()) } else { Ok(7) }
+        });
+        assert_eq!(selected, Some((Provider::FidelityFx, 7)));
+        assert_eq!(attempted, vec![(sl.to_path_buf(), Provider::Streamline), (fsr.to_path_buf(), Provider::FidelityFx)]);
+        let selected = select_provider(Some(sl), Some(fsr), |_, provider| {
+            assert_eq!(provider, Provider::Streamline);
+            Ok(8)
+        });
+        assert_eq!(selected, Some((Provider::Streamline, 8)));
+        assert_eq!(select_provider::<()>(None, None, |_, _| panic!("no paths")), None);
+        assert_eq!(select_provider::<()>(Some(sl), Some(fsr), |_, _| Err("missing".into())), None);
+    }
+
+    #[test]
+    fn dispatch_metadata_keeps_the_verified_console_abi() {
+        assert_eq!(std::mem::offset_of!(DispatchUpscale, resources), 0x18);
+        assert_eq!(std::mem::offset_of!(DispatchUpscale, jitter), 0x168);
+        assert_eq!(std::mem::offset_of!(DispatchUpscale, flags), 0x1ac);
     }
 
     #[test]

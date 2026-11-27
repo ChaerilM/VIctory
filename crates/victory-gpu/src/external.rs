@@ -14,6 +14,17 @@ pub fn host_device() -> Option<ID3D12Device> {
     crate::host::host().map(|h| h.device.clone())
 }
 
+/// Vendor ID of the actual D3D12 adapter (not the first enumerated GPU).
+pub fn host_vendor_id(device: &ID3D12Device) -> Option<u32> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
+    // SAFETY: plain queries on a live D3D12 device and DXGI adapter.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(device.GetAdapterLuid()).ok()?;
+        Some(adapter.GetDesc1().ok()?.VendorId)
+    }
+}
+
 /// A title texture's host copy, moved to the host resource `state` in the
 /// title list `list`, and the state it is in: `state` without the bits the
 /// host copy cannot take (see `host::legal_state`). What the list records
