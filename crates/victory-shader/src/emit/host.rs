@@ -74,18 +74,48 @@ unsafe impl Send for SharedDevice {}
 // SAFETY: as above.
 unsafe impl Sync for SharedDevice {}
 
+/// Return the first NVIDIA hardware device that can run the emitted SM 6.6 shaders.
+pub fn nvidia_device(factory: &IDXGIFactory4) -> Option<ID3D12Device> {
+    // SAFETY: DXGI and D3D12 own the returned COM objects and fill the provided outputs.
+    unsafe {
+        for index in 0.. {
+            let adapter = factory.EnumAdapters1(index).ok()?;
+            let Ok(desc) = adapter.GetDesc1() else {
+                continue;
+            };
+            if desc.VendorId == 0x10de
+                && desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0
+                && let Ok(device) = shader_device(&adapter)
+            {
+                return Some(device);
+            }
+        }
+    }
+    None
+}
+
 fn create_device(warp: bool) -> Result<ID3D12Device, String> {
     // SAFETY: plain D3D12/DXGI calls with valid out pointers.
     unsafe {
-        let mut device: Option<ID3D12Device> = None;
         let factory: IDXGIFactory4 =
             CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
         let adapter: IDXGIAdapter1 = if warp {
             factory.EnumWarpAdapter().map_err(err)?
         } else {
+            if let Some(device) = nvidia_device(&factory) {
+                return Ok(device);
+            }
             hardware_adapter(&factory).map_err(err)?
         };
-        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+        shader_device(&adapter)
+    }
+}
+
+fn shader_device(adapter: &IDXGIAdapter1) -> Result<ID3D12Device, String> {
+    // SAFETY: valid adapter and appropriately sized D3D12 feature query.
+    unsafe {
+        let mut device: Option<ID3D12Device> = None;
+        D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
         let device = device.ok_or("no device")?;
         let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
             HighestShaderModel: D3D_SHADER_MODEL_6_6,

@@ -53,6 +53,14 @@ What each part does today and what it still needs:
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Menus, loading and the world run with the PC upscaler (`VICTORY_FIDELITYFX_DIR`, about 1 s a frame) | The title's own upscaler DLLs: six of their passes are untranslated, so their picture is wrong |
 
+## NVIDIA fork
+
+On PCs with multiple GPUs, the renderer and hardware shader checks prefer an
+NVIDIA adapter with Direct3D feature level 12.0 and Shader Model 6.6. This is
+intended for systems such as a GeForce RTX 3080 Laptop GPU paired with integrated
+graphics. If no NVIDIA adapter qualifies, each path uses its upstream selection.
+Explicit WARP diagnostics still use the software adapter.
+
 ## Getting started
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
