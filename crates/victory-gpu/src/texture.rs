@@ -118,6 +118,7 @@ const KEPT_BYTES: u64 = 64 << 20;
 /// Called before a submission's uploads: the buffers of the last one are
 /// free again (the oldest dropped past `KEPT_BYTES`).
 pub(crate) fn recycle() {
+    crate::gpudetile::recycle();
     {
         let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
         (c.current, c.used) = (0, 0);
@@ -385,7 +386,7 @@ pub(crate) fn record_upload(
     list: &HostList,
     copy: &Arc<crate::resource::HostTexture>,
     staging: &Staging,
-    (buffer, at, subresources): &Upload,
+    upload: &Upload,
 ) -> Option<D3D12_RESOURCE_BARRIER> {
     const COPY_DEST: u32 = 0x400;
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
@@ -393,10 +394,18 @@ pub(crate) fn record_upload(
         // SAFETY: an open list; the barrier names a live texture.
         unsafe { list.list.ResourceBarrier(&[b]) };
     }
-    copies(list, &copy.texture, staging, (buffer, *at), subresources, String::new);
+    let (buffer, at) = match &upload.source {
+        UploadSource::Cpu(buffer, at) => (buffer, *at),
+        UploadSource::Gpu(prepared) => {
+            crate::gpudetile::record(&list.list, prepared.detiler, &prepared.raw, &prepared.linear, &prepared.jobs);
+            list.keep(&prepared.raw);
+            (&prepared.linear, 0)
+        }
+    };
+    copies(list, &copy.texture, staging, (buffer, at), &upload.subresources, String::new);
     list.keep(buffer);
     staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    staging.copied.fetch_add(upload.subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
     list.move_texture(copy, SHADER_RESOURCE)
 }
 
@@ -485,7 +494,21 @@ fn copies(
 
 /// What a refresh gives: a staging buffer, where its space starts in it,
 /// and the subresources detiled into it.
-pub(crate) type Upload = (ID3D12Resource, u64, Vec<u32>);
+pub(crate) struct Upload {
+    source: UploadSource,
+    subresources: Vec<u32>,
+}
+
+enum UploadSource {
+    Cpu(ID3D12Resource, u64),
+    Gpu(crate::gpudetile::Prepared),
+}
+
+impl Upload {
+    fn cpu((buffer, at): (ID3D12Resource, u64), subresources: Vec<u32>) -> Self {
+        Self { source: UploadSource::Cpu(buffer, at), subresources }
+    }
+}
 
 /// Runs `f(i)` for each `i` below `n` on up to a quarter of the CPUs (four
 /// at most: the title's own threads need the rest), here when that is
@@ -524,7 +547,7 @@ pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTextur
     in_parallel(changed.len(), |k| {
         *results[k].lock().unwrap_or_else(|e| e.into_inner()) = work[changed[k]].0.refresh();
     });
-    let mut out: Vec<Option<Upload>> = vec![None; work.len()];
+    let mut out: Vec<Option<Upload>> = (0..work.len()).map(|_| None).collect();
     for (k, r) in results.into_iter().enumerate() {
         out[changed[k]] = r.into_inner().unwrap_or_else(|e| e.into_inner());
     }
@@ -619,7 +642,8 @@ impl Staging {
             if fresh.is_empty() {
                 return (bytes, None);
             }
-            let buffer = self.detile(read, &fresh);
+            let complete = done.iter().any(|&(a, b)| a == 0 && b == size);
+            let buffer = self.detile_upload(read, fresh.clone(), complete);
             if buffer.is_none() {
                 for &i in &fresh {
                     last.hashes[i as usize] = None;
@@ -627,7 +651,7 @@ impl Staging {
             }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
-            return (bytes, buffer.map(|(b, at)| (b, at, fresh)));
+            return (bytes, buffer);
         }
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
@@ -646,7 +670,7 @@ impl Staging {
             let every = all();
             let buffer = self.detile(&zeros, &every);
             last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
-            return (0, buffer.map(|(b, at)| (b, at, every)));
+            return (0, buffer.map(|b| Upload::cpu(b, every)));
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
@@ -657,11 +681,25 @@ impl Staging {
             return (size, None);
         }
         let every = all();
-        let buffer = self.detile(tiled, &every);
+        let buffer = self.detile_upload(tiled, every, true);
         last.hash = buffer.is_some().then_some(hash);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        (size, buffer.map(|(b, at)| (b, at, every)))
+        (size, buffer)
+    }
+
+    /// GPU detiling needs every source byte initialized and only records
+    /// full uploads. Partial refreshes retain the existing CPU path.
+    fn detile_upload(&self, tiled: &[u8], subresources: Vec<u32>, complete: bool) -> Option<Upload> {
+        if complete && subresources.len() == self.footprints.len()
+            && let Some(prepared) = crate::gpudetile::prepare(
+                &self.layout, &self.footprints, &self.rows, self.mips, self.size, tiled,
+            )
+        {
+            tracing::debug!(bytes = self.layout.size, "texture detiled on GPU");
+            return Some(Upload { source: UploadSource::Gpu(prepared), subresources });
+        }
+        self.detile(tiled, &subresources).map(|b| Upload::cpu(b, subresources))
     }
 
     /// Detiles `subresources` of `tiled` (the texture's memory) into a
