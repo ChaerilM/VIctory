@@ -157,14 +157,14 @@ The PowerShell launcher applies a named preset before starting VIctory.
 These experimental switches require the corresponding performance backports
 (PR #1 and #2); older builds simply do not consume the new variables.
 
-| Profile | Window grid | Idle scratch budget | Buffered title reads | Soft VRAM target |
-|---------|-------------|---------------------|----------------------|------------------|
-| default | 4096 KiB | 0 MiB | off | automatic |
-| low | 1024 KiB | 0 MiB | off | automatic |
-| high | 1024 KiB | 256 MiB | on | automatic |
-| 8gb | 1024 KiB | 0 MiB | off | 5120 MiB |
-| 12gb | 1024 KiB | 128 MiB | off | 7680 MiB |
-| 16gb | 1024 KiB | 256 MiB | off | 10240 MiB |
+| Profile | Window grid | Idle scratch | Buffered reads | Soft VRAM target | Reloadable textures | Idle staging |
+|---------|-------------|--------------|----------------|------------------|---------------------|--------------|
+| default | 4096 KiB | 0 MiB | off | automatic | automatic | 576 MiB |
+| low | 1024 KiB | 0 MiB | off | automatic | automatic | 128 MiB |
+| high | 1024 KiB | 256 MiB | on | automatic | automatic | 576 MiB |
+| 8gb | 1024 KiB | 0 MiB | off | 5120 MiB | 4096 MiB | 128 MiB |
+| 12gb | 1024 KiB | 128 MiB | off | 7680 MiB | 6144 MiB | 256 MiB |
+| 16gb | 1024 KiB | 256 MiB | off | 10240 MiB | 8192 MiB | 576 MiB |
 
 The hardware profiles are for **dedicated VRAM**, not system RAM. Inspired
 by [VItoriaBr's 8 GB / 16 GB presets](https://github.com/uiliannn/VItoriaBr#english).
@@ -173,7 +173,17 @@ The 12 GB target is an interpolation, not a measured setting.
 MiB (0 = automatic). It limits the existing DXGI budget threshold, never
 raises it. Only eligible title-fed textures can be evicted, so this is
 not a hard VRAM cap or a separate texture-only budget. More aggressive
-eviction can cause texture churn. The fork's separate card-buffer budget,
+eviction can cause texture churn.
+
+`VICTORY_TEXTURE_BUDGET_MB` is a separate soft limit on reloadable
+title-fed texture copies (0 = automatic). It excludes render targets,
+depth and GPU-written textures and uses the existing eviction pass.
+It is not an allocation gate. The profile values leave nominal room
+for other GPU allocations; they are provisional, not fork benchmarks.
+`VICTORY_STAGING_POOL_MB` bounds the retained upload staging buffers
+between submissions (0 = retain none, default 576). In-flight uploads
+may exceed it. This primarily trades system memory for allocation churn,
+not a hard VRAM limit. The fork's separate card-buffer budget,
 async submission and internal-resolution controls are not implemented here.
 
 From the repository root, after building the release executable:
@@ -199,10 +209,10 @@ create a git-ignored `.env` in the repository root, for example:
 VICTORY_SCRATCH_SPARE_MB=128
 ```
 
-Precedence for the four managed variables: local `.env` > selected preset
+Precedence for the six managed variables: local `.env` > selected preset
 > inherited environment. All other environment variables are left alone.
 The launcher accepts plain KEY=VALUE lines, blank lines and whole-line
-comments. It validates the four numeric settings, rejects unknown names
+comments. It validates the six numeric settings, rejects unknown names
 and duplicate entries, and does not execute file contents. The parent
 PowerShell environment is restored when VIctory exits.
 

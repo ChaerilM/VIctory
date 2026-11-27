@@ -18,7 +18,9 @@ $names = @(
     'VICTORY_WINDOW_KB',
     'VICTORY_SCRATCH_SPARE_MB',
     'VICTORY_BUFFERED_TITLE_READS',
-    'VICTORY_VRAM_TARGET_MB'
+    'VICTORY_VRAM_TARGET_MB',
+    'VICTORY_TEXTURE_BUDGET_MB',
+    'VICTORY_STAGING_POOL_MB'
 )
 
 function Read-PerformanceEnv([string]$Path) {
@@ -56,6 +58,20 @@ function Read-PerformanceEnv([string]$Path) {
                 $mb = 0
                 if (-not [int]::TryParse($value, [ref]$mb) -or ($mb -ne 0 -and ($mb -lt 1024 -or $mb -gt 65536))) {
                     throw "$name must be 0 (automatic) or between 1024 and 65536"
+                }
+                $value = $mb.ToString()
+            }
+            'VICTORY_TEXTURE_BUDGET_MB' {
+                $mb = 0
+                if (-not [int]::TryParse($value, [ref]$mb) -or ($mb -ne 0 -and ($mb -lt 256 -or $mb -gt 65536))) {
+                    throw "$name must be 0 (automatic) or between 256 and 65536"
+                }
+                $value = $mb.ToString()
+            }
+            'VICTORY_STAGING_POOL_MB' {
+                $mb = 0
+                if (-not [int]::TryParse($value, [ref]$mb) -or $mb -gt 2048) {
+                    throw "$name must be between 0 and 2048"
                 }
                 $value = $mb.ToString()
             }
