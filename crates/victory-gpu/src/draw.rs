@@ -748,7 +748,14 @@ impl State {
             // their addresses go into the page table.
             let mut roots = Vec::new();
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                let mut stack = [0u32; 64];
+                let mut overflow = Vec::new();
+                let values = if (dwords as usize) <= stack.len() {
+                    &mut stack[..dwords as usize]
+                } else {
+                    overflow.resize(dwords as usize, 0);
+                    overflow.as_mut_slice()
+                };
                 for u in &t.host.user_data {
                     if u.root == RootType::Descriptor
                         && u.dword == 0
@@ -793,12 +800,16 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                // A zero-count call can crash on NVIDIA. No constants are read
+                // by a stage that declares no user data.
+                if !values.is_empty() {
+                    // SAFETY: an open list; `values` covers the parameter.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        } else {
+                            l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        }
                     }
                 }
             }
@@ -1839,42 +1850,59 @@ impl State {
     }
 }
 
+/// Look up a signature without holding the cache lock across a driver call.
+/// Concurrent misses may create duplicates, but only one is retained.
+fn cached_command_signature<K: Copy + Eq, V: Clone>(
+    cache: &std::sync::Mutex<Vec<(K, V)>>,
+    key: K,
+    create: impl FnOnce() -> Option<V>,
+) -> Option<V> {
+    {
+        let made = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, signature)) = made.iter().find(|(k, _)| *k == key) {
+            return Some(signature.clone());
+        }
+    }
+    let created = create()?;
+    let mut made = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, signature)) = made.iter().find(|(k, _)| *k == key) {
+        return Some(signature.clone());
+    }
+    made.push((key, created.clone()));
+    Some(created)
+}
+
 /// The host command signature for one argument of `kind` with records
-/// `stride` bytes apart (no root arguments, so no root signature), made
-/// once.
+/// `stride` bytes apart (no root arguments, so no root signature).
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        return Some(s.clone());
-    }
-    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
-        Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
-        ..Default::default()
-    };
-    let desc = D3D12_COMMAND_SIGNATURE_DESC {
-        ByteStride: stride,
-        NumArgumentDescs: 1,
-        pArgumentDescs: &argument,
-        NodeMask: 0,
-    };
-    let mut signature: Option<ID3D12CommandSignature> = None;
-    // SAFETY: a description of one argument; no root arguments.
-    let result = unsafe {
-        crate::host::host()?.device.CreateCommandSignature(
-            &desc,
-            None::<&ID3D12RootSignature>,
-            &mut signature,
-        )
-    };
-    if let Err(e) = result {
-        once!(error = %e, kind, stride, "host command signature refused");
-        return None;
-    }
-    let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
-    Some(signature)
+    cached_command_signature(&MADE, (kind, stride), || {
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: stride,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &argument,
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: a description of one argument; no root arguments.
+        let result = unsafe {
+            crate::host::host()?.device.CreateCommandSignature(
+                &desc,
+                None::<&ID3D12RootSignature>,
+                &mut signature,
+            )
+        };
+        if let Err(e) = result {
+            once!(error = %e, kind, stride, "host command signature refused");
+            return None;
+        }
+        signature
+    })
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
@@ -2028,6 +2056,36 @@ const QUAD_STRIP: u32 = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_signature_cache_does_not_hold_lock_during_creation() {
+        let cache = std::sync::Mutex::new(vec![(1u32, 100u32)]);
+        assert_eq!(
+            cached_command_signature(&cache, 2, || {
+                assert!(cache.try_lock().is_ok());
+                assert_eq!(
+                    cached_command_signature(&cache, 1, || unreachable!()),
+                    Some(100)
+                );
+                Some(200)
+            }),
+            Some(200)
+        );
+        assert_eq!(cached_command_signature(&cache, 2, || unreachable!()), Some(200));
+        assert_eq!(cached_command_signature(&cache, 3, || None), None);
+        assert_eq!(cached_command_signature(&cache, 3, || Some(300)), Some(300));
+    }
+
+    #[test]
+    fn command_signature_cache_retains_first_published_value() {
+        let cache = std::sync::Mutex::new(Vec::new());
+        let result = cached_command_signature(&cache, 1, || {
+            assert_eq!(cached_command_signature(&cache, 1, || Some(100)), Some(100));
+            Some(200)
+        });
+        assert_eq!(result, Some(100));
+        assert_eq!(*cache.lock().unwrap(), vec![(1, 100)]);
+    }
 
     /// A root signature that indexes the heaps directly needs one of each
     /// kind bound before it is set: our sampler heap stands in for a title
