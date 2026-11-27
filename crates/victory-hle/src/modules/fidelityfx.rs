@@ -37,7 +37,7 @@ use crate::{HleModule, hle_export};
 /// The PC build's upscaler, which has the five functions itself.
 const DLL: &str = "amd_fidelityfx_upscaler_dx12.dll";
 const STREAMLINE_DLL: &str = "victory_streamline_upscaler.dll";
-const STREAMLINE_ABI: u32 = 1;
+const STREAMLINE_ABI: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Provider {
@@ -157,6 +157,21 @@ type Create = unsafe extern "C" fn(*mut *mut c_void, *mut Header, *const c_void)
 type Destroy = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> u32;
 /// Configure, query and dispatch.
 type Call = unsafe extern "C" fn(*mut *mut c_void, *mut Header) -> u32;
+type Retain = unsafe extern "C" fn(*mut c_void) -> u32;
+type Release = unsafe extern "C" fn(*mut c_void);
+
+/// A native context reference owned by the recorded host list.
+struct RecordedContext {
+    context: usize,
+    release: Release,
+}
+
+impl Drop for RecordedContext {
+    fn drop(&mut self) {
+        // SAFETY: the ABI-2 retain succeeded; exactly one release is owed.
+        unsafe { (self.release)(self.context as *mut c_void) };
+    }
+}
 
 // Keep loaded code alive for all contexts and recorded work. On a failed
 // probe, the provider must have left no device work or background threads.
@@ -177,6 +192,7 @@ struct Host {
     configure: Call,
     query: Call,
     dispatch: Call,
+    lifetime: Option<(Retain, Release)>,
     device: ID3D12Device,
 }
 
@@ -281,6 +297,17 @@ fn load(dir: &Path, provider: Provider) -> Result<(Host, String), String> {
             return Err(format!("unsupported Streamline adapter ABI {abi}, expected {STREAMLINE_ABI}"));
         }
     }
+    let lifetime = if provider == Provider::Streamline {
+        // SAFETY: these exports are mandatory in adapter ABI 2.
+        Some(unsafe {
+            (
+                std::mem::transmute::<*const c_void, Retain>(find(c"victoryStreamlineBridgeRetain")?),
+                std::mem::transmute::<*const c_void, Release>(find(c"victoryStreamlineBridgeRelease")?),
+            )
+        })
+    } else {
+        None
+    };
     // SAFETY: the API's exports, with its signatures.
     let host = unsafe {
         Host {
@@ -291,6 +318,7 @@ fn load(dir: &Path, provider: Provider) -> Result<(Host, String), String> {
             configure: std::mem::transmute::<*const c_void, Call>(find(c"ffxConfigure")?),
             query: std::mem::transmute::<*const c_void, Call>(find(c"ffxQuery")?),
             dispatch: std::mem::transmute::<*const c_void, Call>(find(c"ffxDispatch")?),
+            lifetime,
             device,
         }
     };
@@ -520,7 +548,20 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         // SAFETY: a live texture.
         unsafe { t.GetDesc() }.Format.0
     }).collect::<Vec<_>>(), "FidelityFX: first upscaling, host formats of its textures");
-    victory_gpu::external::record(list, |host_list| {
+    let retained = if let Some((retain, release)) = host.lifetime {
+        if context.is_null() {
+            return PARAMETER;
+        }
+        // SAFETY: the title owns the live context during this call.
+        let ptr = unsafe { *context };
+        if ptr.is_null() || unsafe { retain(ptr) } != OK {
+            return PARAMETER;
+        }
+        Some(RecordedContext { context: ptr as usize, release })
+    } else {
+        None
+    };
+    victory_gpu::external::record_retained(list, retained, |host_list| {
         dispatch.list = host_list.as_raw();
         // SAFETY: the PC dispatch on host objects; the context is the host's.
         unsafe { (host.dispatch)(context, &raw mut dispatch.header) }

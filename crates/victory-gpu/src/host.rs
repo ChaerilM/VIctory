@@ -1016,6 +1016,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Native provider leases retained through recorded and queued work.
+    external: Vec<Box<dyn std::any::Any + Send>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -2270,6 +2272,11 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    /// Retains a provider lease through this list's lifetime.
+    pub(crate) fn keep_external(&self, lease: impl Send + 'static) {
+        self.deferred().external.push(Box::new(lease));
     }
 
     /// Whether this is the first time since the reset that the list asks
