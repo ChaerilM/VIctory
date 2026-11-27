@@ -1075,6 +1075,26 @@ impl Host {
         })
     }
 
+    /// Wave sizes reported by the actual selected D3D12 device.
+    /// If the query fails or is inconsistent, let the driver try the PSO.
+    pub(crate) fn wave_lane_range(&self) -> Option<(u32, u32)> {
+        static RANGE: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+        *RANGE.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: matching feature structure and byte size.
+            unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }.ok()?;
+            let (min, max) = (options.WaveLaneCountMin, options.WaveLaneCountMax);
+            tracing::info!(min, max, wave_ops = options.WaveOps.as_bool(), "host wave lane range");
+            (options.WaveOps.as_bool() && min > 0 && min <= max).then_some((min, max))
+        })
+    }
+
     /// Whether the host runs 64-bit atomics on typed resources in the
     /// descriptor heap (translated 64-bit image atomics); logged once.
     pub(crate) fn heap_atomics64(&self) -> bool {

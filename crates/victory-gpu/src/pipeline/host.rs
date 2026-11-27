@@ -434,6 +434,16 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        // A fixed wave outside the reported range cannot run as emitted.
+        // Do not rewrite it to another size: that needs proven lane semantics.
+        if let Some(cs) = compute
+            && let Some(wave) = cs.translated()?.host.required_wave_size()
+            && let Some((min, max)) = host.wave_lane_range()
+            && !(min..=max).contains(&wave)
+        {
+            tracing::debug!(wave, min, max, ?shaders, "compute wave size outside host range");
+            return refuse("fixed compute wave size unsupported by host GPU", shaders);
+        }
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
         let atomics64 = stages.iter().any(|(s, _)| {
             let Some(t) = s.translated() else {

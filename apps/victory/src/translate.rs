@@ -64,6 +64,9 @@ struct Tally {
     cs_emitted: usize,
     cs_validated: usize,
     cs_pipelines: usize,
+    cs_wave32: usize,
+    cs_wave64: usize,
+    cs_wave_unspecified: usize,
     /// The same for mesh programs.
     ms_programs: usize,
     ms_emitted: usize,
@@ -126,6 +129,9 @@ impl Tally {
         self.cs_emitted += other.cs_emitted;
         self.cs_validated += other.cs_validated;
         self.cs_pipelines += other.cs_pipelines;
+        self.cs_wave32 += other.cs_wave32;
+        self.cs_wave64 += other.cs_wave64;
+        self.cs_wave_unspecified += other.cs_wave_unspecified;
         self.ms_programs += other.ms_programs;
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
@@ -281,6 +287,10 @@ pub fn run(
     println!(
         "             {} emitted of {} compute programs; {} validated, {} pipelines",
         t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines
+    );
+    println!(
+        "compute waves: {} fixed 32, {} fixed 64, {} no recognized fixed requirement",
+        t.cs_wave32, t.cs_wave64, t.cs_wave_unspecified
     );
     println!(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
@@ -600,6 +610,17 @@ fn check(
     checks: &mut Checks,
     label: impl Fn() -> String,
 ) {
+    if shader.stage == HwStage::Cs {
+        let wave = shader.required_wave_size();
+        match wave {
+            Some(32) => t.cs_wave32 += 1,
+            Some(64) => t.cs_wave64 += 1,
+            _ => t.cs_wave_unspecified += 1,
+        }
+        if t.list && wave == Some(64) {
+            t.lines.push(format!("{}  fixed Wave64", label()));
+        }
+    }
     if let Some(keep) = &checks.keep {
         lock(keep).push((label(), shader.clone()));
     }
