@@ -1602,10 +1602,37 @@ fn vram_target() -> Option<u64> {
 /// Keep the existing hysteresis ratio and eviction eligibility.
 #[cfg(windows)]
 fn eviction_excess(used: f64, budget: f64, target_mib: Option<u64>) -> u64 {
-    let high = BUDGET_HIGH * budget;
-    let high = target_mib.map_or(high, |mib| high.min(mib as f64 * 1_048_576.0 / 1e6));
-    let low = if target_mib.is_some() { high * (BUDGET_LOW / BUDGET_HIGH) } else { BUDGET_LOW * budget };
+    let driver_high = BUDGET_HIGH * budget;
+    let high = target_mib.map_or(driver_high, |mib| driver_high.min(mib as f64 * 1_048_576.0 / 1e6));
+    let low = if high < driver_high { high * (BUDGET_LOW / BUDGET_HIGH) } else { BUDGET_LOW * budget };
     if used > high { ((used - low) * 1e6) as u64 } else { 0 }
+}
+
+/// Soft budget of live, reloadable title-fed texture copies (MiB).
+/// Zero or an invalid setting keeps the old DXGI-only policy.
+#[cfg(windows)]
+fn texture_budget() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let limit = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| (256..=65536).contains(&v))
+            .map(|v| v << 20);
+        if let Some(bytes) = limit {
+            tracing::info!(mib = bytes >> 20, "soft reloadable texture budget enabled");
+        }
+        limit
+    })
+}
+
+/// A second pressure signal, not additive with the DXGI excess: evicting
+/// one texture satisfies both. Leave 5% headroom to reduce repeated sweeps.
+#[cfg(windows)]
+fn texture_excess(bytes: u64, limit: Option<u64>) -> u64 {
+    match limit {
+        Some(limit) if bytes > limit => bytes - (limit - limit / 20),
+        _ => 0,
+    }
 }
 
 /// Once per presented frame, before a submission (`Host::execute`, one at a
@@ -1643,7 +1670,16 @@ fn evict(frame: u64, now: u64, over: u64) -> (u64, u64) {
     // reported as new only once, so its first read alone stamped it; run
     // evict1 gave up and made again hundreds of textures a frame).
     let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
-    evict_among(&candidates(), &read, frame, now, over)
+    let candidates = candidates();
+    let over = if let Some(limit) = texture_budget() {
+        // candidates() already deduplicates aliased host copies and excludes
+        // GPU-written textures, depth and render targets.
+        let bytes = candidates.iter().fold(0u64, |n, (t, _)| n.saturating_add(t.bytes));
+        over.max(texture_excess(bytes, Some(limit)))
+    } else {
+        over
+    };
+    evict_among(&candidates, &read, frame, now, over)
 }
 
 /// [`evict`] among `candidates`, with `read` (raw pointers) the host
@@ -2518,6 +2554,16 @@ mod tests {
         assert!(choose(&[early], frame, now, 0).is_empty(), "too few frames ago");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn texture_budget_uses_headroom_without_changing_default() {
+        assert_eq!(texture_excess(1000, None), 0);
+        assert_eq!(texture_excess(1000, Some(1000)), 0);
+        assert_eq!(texture_excess(1001, Some(1000)), 51);
+        assert_eq!(texture_excess(1200, Some(1000)), 250);
+    }
+
+    #[cfg(windows)]
     #[test]
     fn vram_target_only_lowers_the_dynamic_eviction_threshold() {
         assert_eq!(eviction_excess(899.0, 1000.0, None), 0);

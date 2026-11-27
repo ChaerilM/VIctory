@@ -112,16 +112,44 @@ static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
     used: Vec::new(),
 });
 
-/// Free staging buffers kept at most.
+/// Free large staging buffers kept at most in the default configuration.
 const KEPT_BYTES: u64 = 64 << 20;
+
+/// Split the idle budget between standalone buffers and 32 MiB chunks.
+/// The original 64 MiB + 16 chunks policy is the default.
+fn staging_limits(mib: Option<u64>) -> (u64, usize) {
+    let Some(mib) = mib.filter(|&v| v <= 2048) else {
+        return (KEPT_BYTES, CHUNKS_KEPT);
+    };
+    let bytes = mib << 20;
+    let standalone = (bytes / 4).min(KEPT_BYTES);
+    let chunks = ((bytes - standalone) / CHUNK) as usize;
+    // Give the unused tail of the chunk allocation to standalone buffers.
+    (bytes - chunks as u64 * CHUNK, chunks)
+}
+
+fn staging_budget() -> (u64, usize) {
+    static LIMITS: std::sync::OnceLock<(u64, usize)> = std::sync::OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let mib = std::env::var("VICTORY_STAGING_POOL_MB").ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let limits = staging_limits(mib);
+        if mib.is_some_and(|v| v <= 2048) {
+            tracing::info!(standalone_mib = limits.0 >> 20, chunks = limits.1,
+                "texture staging idle budget enabled");
+        }
+        limits
+    })
+}
 
 /// Called before a submission's uploads: the buffers of the last one are
 /// free again (the oldest dropped past `KEPT_BYTES`).
 pub(crate) fn recycle() {
+    let (kept_bytes, chunks_kept) = staging_budget();
     {
         let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
         (c.current, c.used) = (0, 0);
-        c.all.truncate(CHUNKS_KEPT);
+        c.all.truncate(chunks_kept);
     }
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
     let b = &mut *b;
@@ -129,7 +157,7 @@ pub(crate) fn recycle() {
         b.free_bytes += e.0;
         b.free.push_back(e);
     }
-    while b.free_bytes > KEPT_BYTES
+    while b.free_bytes > kept_bytes
         && let Some((n, ..)) = b.free.pop_front()
     {
         b.free_bytes -= n;
@@ -852,6 +880,18 @@ mod tests {
         assert_eq!(subresource_len(0, 256, 4, 1, 784), 784);
         assert_eq!(subresource_len(512, 256, 4, 1, 784), 272);
         assert_eq!(subresource_len(0, 256, 4, 1, 2048), 1024);
+    }
+
+    #[test]
+    fn staging_idle_budget_is_bounded() {
+        assert_eq!(staging_limits(None), (64 << 20, 16));
+        assert_eq!(staging_limits(Some(576)), staging_limits(None));
+        assert_eq!(staging_limits(Some(0)), (0, 0));
+        assert_eq!(staging_limits(Some(2049)), staging_limits(None));
+        for mib in [1, 32, 64, 128, 256, 512, 1024, 2048] {
+            let (standalone, chunks) = staging_limits(Some(mib));
+            assert_eq!(standalone + chunks as u64 * CHUNK, mib << 20);
+        }
     }
 
     #[test]
