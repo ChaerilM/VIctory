@@ -151,6 +151,69 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+## Performance presets (.env)
+
+The PowerShell launcher applies a named preset before starting VIctory.
+These experimental switches require the corresponding performance backports
+(PR #1 and #2); older builds simply do not consume the new variables.
+
+| Profile | Window grid | Idle scratch budget | Buffered title reads | Soft VRAM target |
+|---------|-------------|---------------------|----------------------|------------------|
+| default | 4096 KiB | 0 MiB | off | automatic |
+| low | 1024 KiB | 0 MiB | off | automatic |
+| high | 1024 KiB | 256 MiB | on | automatic |
+| 8gb | 1024 KiB | 0 MiB | off | 5120 MiB |
+| 12gb | 1024 KiB | 128 MiB | off | 7680 MiB |
+| 16gb | 1024 KiB | 256 MiB | off | 10240 MiB |
+
+The hardware profiles are for **dedicated VRAM**, not system RAM. Inspired
+by [VItoriaBr's 8 GB / 16 GB presets](https://github.com/uiliannn/VItoriaBr#english).
+The 12 GB target is an interpolation, not a measured setting.
+`VICTORY_VRAM_TARGET_MB` sets a soft local-memory eviction threshold in
+MiB (0 = automatic). It limits the existing DXGI budget threshold, never
+raises it. Only eligible title-fed textures can be evicted, so this is
+not a hard VRAM cap or a separate texture-only budget. More aggressive
+eviction can cause texture churn. The fork's separate card-buffer budget,
+async submission and internal-resolution controls are not implemented here.
+
+From the repository root, after building the release executable:
+
+```powershell
+.\scripts\launch.ps1 -Preset default -VictoryArgs @('run', 'D:\game\title.exe', '--execute')
+.\scripts\launch.ps1 -Preset low -VictoryArgs @('run', 'D:\game\title.exe', '--execute')
+.\scripts\launch.ps1 -Preset high -VictoryArgs @('run', 'D:\game\title.exe', '--execute')
+.\scripts\launch.ps1 -Preset 8gb -VictoryArgs @('run', 'D:\game\title.exe', '--execute')
+.\scripts\launch.ps1 -Preset 12gb -ShowSettings
+.\scripts\launch.ps1 -Preset 16gb -ShowSettings
+```
+
+Use `-VictoryExe 'C:\vt\release\victory.exe'` for a custom build path.
+The launcher accepts any VIctory command via `-VictoryArgs`, so the same
+profile can be used when prebuilding shaders or pipelines.
+
+The tracked profiles are in `presets/*.env`. To override a setting locally,
+create a git-ignored `.env` in the repository root, for example:
+
+```dotenv
+# Only the settings you want to override
+VICTORY_SCRATCH_SPARE_MB=128
+```
+
+Precedence for the four managed variables: local `.env` > selected preset
+> inherited environment. All other environment variables are left alone.
+The launcher accepts plain KEY=VALUE lines, blank lines and whole-line
+comments. It validates the four numeric settings, rejects unknown names
+and duplicate entries, and does not execute file contents. The parent
+PowerShell environment is restored when VIctory exits.
+
+These are memory/performance profiles, not graphics-quality presets.
+Smaller windows may increase overlapping copies; the spare budget is not a
+total memory limit. Buffered reads can change I/O behavior. Test one switch
+at a time, and compare frame times, memory use and rendering. No FPS gain
+is guaranteed. The existing `victory.toml` remains the configuration for
+game, cache and data paths. Debug and rendering-correctness switches are
+not changed by the presets.
+
 ## Commands
 
 ```
