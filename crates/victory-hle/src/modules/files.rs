@@ -18,8 +18,11 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
+use windows_sys::Win32::Foundation::GENERIC_READ;
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
-use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, GetLogicalDrives,
+};
 
 use crate::{HleExport, HleModule, hle_export};
 
@@ -276,9 +279,25 @@ pub extern "system" fn CreateFileW(
         share,
         security,
         disposition,
-        flags,
+        cached_read_flags(access, flags, buffered_title_reads() && p.1.is_some()),
         template,
     )
+}
+
+/// Opt in to the host file cache for synchronous read-only opens of mounted
+/// title files. Leave unbuffered semantics unchanged by default, and always
+/// preserve overlapped opens (including ReadFileScatter) and write handles.
+fn buffered_title_reads() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_BUFFERED_TITLE_READS").is_some_and(|v| v == "1"))
+}
+
+fn cached_read_flags(access: u32, flags: u32, enabled: bool) -> u32 {
+    if enabled && access == GENERIC_READ && flags & FILE_FLAG_OVERLAPPED == 0 {
+        flags & !FILE_FLAG_NO_BUFFERING
+    } else {
+        flags
+    }
 }
 
 pub extern "system" fn CreateFileA(
@@ -740,6 +759,26 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffered_title_read_flags_preserve_other_open_modes() {
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_SEQUENTIAL_SCAN;
+        let flags = FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN;
+        assert_eq!(cached_read_flags(GENERIC_READ, flags, false), flags);
+        assert_eq!(
+            cached_read_flags(GENERIC_READ, flags, true),
+            FILE_FLAG_SEQUENTIAL_SCAN
+        );
+        assert_eq!(
+            cached_read_flags(GENERIC_READ | GENERIC_WRITE, flags, true),
+            flags
+        );
+        assert_eq!(
+            cached_read_flags(GENERIC_READ, flags | FILE_FLAG_OVERLAPPED, true),
+            flags | FILE_FLAG_OVERLAPPED
+        );
+    }
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().chain([0]).collect()
