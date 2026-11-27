@@ -225,6 +225,7 @@ fn show_config() -> Result<()> {
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
     println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir));
+    println!("streamline  : {}", status(&cfg.streamline_dir));
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
@@ -239,6 +240,7 @@ fn check_policy(cfg: &victory_core::Config) -> Result<()> {
         .game_dir
         .iter()
         .chain(&cfg.test_titles)
+        .chain(&cfg.streamline_dir)
         .chain([&cfg.cache_dir, &cfg.data_dir])
     {
         if let Err(e) = victory_core::ensure_outside_repo(p) {

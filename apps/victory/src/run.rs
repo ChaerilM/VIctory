@@ -58,9 +58,16 @@ pub fn run(
         victory_hle::modules::xmem::low_guards::install();
     }
     let cfg = victory_core::Config::load()?;
-    // Before the import registry is first used: it holds the module only
-    // when the host's FidelityFX serves.
-    victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
+    // The provider DLL is supplied by the user, never stored in this repo.
+    if let Some(dir) = &cfg.streamline_dir {
+        victory_core::ensure_outside_repo(dir)?;
+        victory_core::ensure_outside_repo(&dir.join("victory_streamline_upscaler.dll"))?;
+    }
+    // Choose exactly one host provider before the import registry is used.
+    victory_hle::modules::fidelityfx::use_host_dirs(
+        cfg.streamline_dir.as_deref(),
+        cfg.fidelityfx_dir.as_deref(),
+    );
     let prepared = victory_loader::prepare(
         &std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?,
     )?;
