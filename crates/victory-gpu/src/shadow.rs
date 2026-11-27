@@ -1057,12 +1057,44 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// allocations if memory use grows.
 const WINDOW: u64 = 4 << 20;
 
+/// Experimental grid for asks with a known length. Keep the original grid
+/// for lengthless root views: their shaders may read far beyond the address.
+fn window_grid(kb: Option<u64>) -> u64 {
+    match kb {
+        Some(kb) if kb.is_power_of_two() && (64..=4096).contains(&kb) => kb << 10,
+        _ => WINDOW,
+    }
+}
+
+fn loose_grid() -> u64 {
+    static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *GRID.get_or_init(|| {
+        let kb = std::env::var("VICTORY_WINDOW_KB").ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let grid = window_grid(kb);
+        if grid != WINDOW {
+            tracing::info!(kb = grid >> 10, "experimental fine memory windows for known-length views");
+        }
+        grid
+    })
+}
+
+fn loose_range(address: u64, end: u64, grid: u64) -> Option<(u64, u64)> {
+    let bytes = end.checked_sub(address)?;
+    if bytes == 0 {
+        return None;
+    }
+    let grid = if bytes == 1 { WINDOW } else { grid };
+    let start = address & !(grid - 1);
+    let len = end.checked_next_multiple_of(grid)?.checked_sub(start)?;
+    Some((start, len))
+}
+
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+    let (start, len) = loose_range(address, end, loose_grid())?;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
@@ -1305,6 +1337,22 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn fine_window_grid_covers_explicit_ranges_and_keeps_root_hulls() {
+        let mib = 1 << 20;
+        assert_eq!(window_grid(None), WINDOW);
+        for kb in [0, 32, 1000, 8192, u64::MAX] {
+            assert_eq!(window_grid(Some(kb)), WINDOW);
+        }
+        assert_eq!(window_grid(Some(1024)), mib);
+        assert_eq!(window_grid(Some(64)), 64 << 10);
+        assert_eq!(loose_range(mib + 32, mib + 96, mib), Some((mib, mib)));
+        assert_eq!(loose_range(2 * mib - 16, 2 * mib + 16, mib), Some((mib, 2 * mib)));
+        assert_eq!(loose_range(mib + 32, mib + 33, mib), Some((0, WINDOW)));
+        assert_eq!(loose_range(mib, mib, mib), None);
+        assert_eq!(loose_range(u64::MAX - 8, u64::MAX, mib), None);
+    }
 
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
     /// that use title memory (`memory`) or of the others.

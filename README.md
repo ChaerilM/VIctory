@@ -132,6 +132,18 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
+Experimental memory tuning (off by default; compare the same scene with
+and without each switch):
+
+- `VICTORY_WINDOW_KB=1024`: finer shadow windows for known-length accesses,
+  from 64 to 4096 KiB (powers of two); default 4096. Lengthless root views
+  keep the original 4 MiB grid. Smaller windows can increase overlapping
+  copies and page-table work, so check rendering and memory use.
+- `VICTORY_SCRATCH_SPARE_MB=128`: share unused upload scratch chunks
+  between successfully reset command lists, capped at 512 MiB. Default 0
+  retains the existing per-list reuse. This trades spare memory for fewer
+  driver allocations; it is not a total scratch-memory limit.
+
 Set `VICTORY_WINDOW_MAX=1920x1080` before launching to limit the title's
 top-level window to that bounding box. Smaller windows keep their size,
 larger windows keep their proportions, and the monitor's work area still

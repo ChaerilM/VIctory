@@ -624,7 +624,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn scratch_spare_is_bounded_and_uses_best_fit() {
+        let mut spare = ScratchSpare::new();
+        assert_eq!(spare.give(64, 1, 512), None);
+        assert_eq!(spare.give(128, 2, 512), None);
+        assert_eq!(spare.give(256, 3, 512), None);
+        assert_eq!(spare.give(128, 4, 512), Some(4));
+        assert_eq!(spare.bytes, 448);
+        assert_eq!(spare.take(96), Some(2));
+        assert_eq!(spare.bytes, 320);
+        assert_eq!(spare.take(64), Some(1));
+        assert_eq!(spare.take(64), None);
+        assert_eq!(spare.take(128), Some(3));
+        assert_eq!(spare.bytes, 0);
+    }
+
+    #[test]
     fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
+        if scratch_spare_bytes() != 0 {
+            eprintln!("skipping default per-list scratch reuse test: shared pool enabled");
+            return;
+        }
         let Some(host) = host() else { return };
         let list = host.new_list().unwrap();
         let first = list.scratch(1).unwrap();
@@ -970,6 +990,74 @@ struct ScratchChunk {
     mapped: usize,
     gpu: u64,
     capacity: u64,
+}
+
+/// Free scratch chunks shared by command lists. Only returned after a
+/// successful reset (the caller has waited for the list's last submission).
+/// A zero budget preserves the old per-list reuse.
+struct ScratchSpare<T> {
+    chunks: Vec<(u64, T)>,
+    bytes: u64,
+}
+
+impl<T> ScratchSpare<T> {
+    const fn new() -> Self {
+        Self { chunks: Vec::new(), bytes: 0 }
+    }
+
+    fn take(&mut self, capacity: u64) -> Option<T> {
+        // Prefer the smallest adequate chunk, with a bounded size mismatch.
+        let index = self.chunks.iter().enumerate()
+            .filter(|(_, (size, _))| *size >= capacity && *size <= capacity.saturating_mul(2))
+            .min_by_key(|(_, (size, _))| *size)
+            .map(|(i, _)| i)?;
+        let (size, chunk) = self.chunks.swap_remove(index);
+        self.bytes -= size;
+        Some(chunk)
+    }
+
+    fn give(&mut self, size: u64, chunk: T, cap: u64) -> Option<T> {
+        if size > cap.saturating_sub(self.bytes) {
+            return Some(chunk);
+        }
+        self.chunks.push((size, chunk));
+        self.bytes += size;
+        None
+    }
+}
+
+static SCRATCH_SPARE: Mutex<ScratchSpare<ScratchChunk>> = Mutex::new(ScratchSpare::new());
+
+fn scratch_spare_bytes() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let cap = std::env::var("VICTORY_SCRATCH_SPARE_MB").ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            .min(512) << 20;
+        if cap != 0 {
+            tracing::info!(mb = cap >> 20, "shared command-list scratch pool enabled");
+        }
+        cap
+    })
+}
+
+/// The list has reset successfully, so its former GPU addresses are no
+/// longer referenced by its recording. Keep no more than the configured cap.
+fn return_scratch(scratch: &mut Scratch, cap: u64) {
+    let mut excess = Vec::new();
+    {
+        let mut spare = SCRATCH_SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        for chunk in scratch.chunks.drain(..) {
+            if let Some(chunk) = spare.give(chunk.capacity, chunk, cap) {
+                excess.push(chunk);
+            }
+        }
+    }
+    // Driver destruction can be slow; never hold the shared pool lock for it.
+    if !excess.is_empty() {
+        release_later(Box::new(excess));
+    }
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -1809,6 +1897,11 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        let cap = scratch_spare_bytes();
+        if cap != 0 {
+            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            return_scratch(&mut scratch, cap);
+        }
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -2208,14 +2301,25 @@ impl HostList {
         if s.current == s.chunks.len() {
             let next = s.chunks.last().map_or(FIRST_SCRATCH_CHUNK, |c| 2 * c.capacity);
             let capacity = len.next_multiple_of(FIRST_SCRATCH_CHUNK).max(next).min(SCRATCH_CHUNK);
-            let (buffer, data) = host.upload_buffer(capacity)?;
-            name(&buffer, || format!("list scratch {capacity:#x}"));
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            #[cfg(feature = "diagnostics")]
-            tracing::debug!(target: "victory_gpu::scratch", list = ?std::ptr::from_ref(self),
-                chunk = s.current, requested = len, capacity, "allocated list scratch");
-            s.chunks.push(ScratchChunk { _buffer: buffer, mapped: data as usize, gpu, capacity });
+            let kept = if scratch_spare_bytes() != 0 {
+                SCRATCH_SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(capacity)
+            } else {
+                None
+            };
+            let chunk = match kept {
+                Some(chunk) => chunk,
+                None => {
+                    let (buffer, data) = host.upload_buffer(capacity)?;
+                    name(&buffer, || format!("list scratch {capacity:#x}"));
+                    // SAFETY: a live buffer.
+                    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                    #[cfg(feature = "diagnostics")]
+                    tracing::debug!(target: "victory_gpu::scratch", list = ?std::ptr::from_ref(self),
+                        chunk = s.current, requested = len, capacity, "allocated list scratch");
+                    ScratchChunk { _buffer: buffer, mapped: data as usize, gpu, capacity }
+                }
+            };
+            s.chunks.push(chunk);
             s.used = 0;
         }
         let chunk = &s.chunks[s.current];
