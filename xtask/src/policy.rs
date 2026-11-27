@@ -147,7 +147,10 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    let allowed = ALLOWED_NAMES.contains(&name)
+    // Only the checked-in, authored numeric presets are allowed, not
+    // arbitrary local .env files (which may contain private configuration).
+    let preset = matches!(path, "presets/default.env" | "presets/low.env" | "presets/high.env");
+    let allowed = preset || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
             .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
@@ -228,6 +231,16 @@ mod tests {
     #[test]
     fn repository_passes_policy() {
         super::run(&crate::workspace_root(), false).unwrap();
+    }
+
+    #[test]
+    fn only_named_env_presets_are_allowed() {
+        for path in ["presets/default.env", "presets/low.env", "presets/high.env"] {
+            assert!(check(path, b"VICTORY_WINDOW_KB=1024\n").is_empty());
+            assert!(!check(path, b"\0").is_empty());
+        }
+        assert!(!check(".env", b"VICTORY_WINDOW_KB=1024\n").is_empty());
+        assert!(!check("presets/local.env", b"KEY=secret\n").is_empty());
     }
 
     #[test]

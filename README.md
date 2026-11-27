@@ -151,6 +151,54 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+## Performance presets (.env)
+
+The PowerShell launcher applies a named preset before starting VIctory.
+These experimental switches require the corresponding performance backports
+(PR #1 and #2); older builds simply do not consume the new variables.
+
+| Profile | Window grid | Idle scratch budget | Buffered title reads |
+|---------|-------------|---------------------|----------------------|
+| default | 4096 KiB | 0 MiB | off |
+| low | 1024 KiB | 0 MiB | off |
+| high | 1024 KiB | 256 MiB | on |
+
+From the repository root, after building the release executable:
+
+```powershell
+.\scripts\launch.ps1 -Preset default -VictoryArgs @('run', 'D:\game\title.exe', '--execute')
+.\scripts\launch.ps1 -Preset low -VictoryArgs @('run', 'D:\game\title.exe', '--execute')
+.\scripts\launch.ps1 -Preset high -VictoryArgs @('run', 'D:\game\title.exe', '--execute')
+.\scripts\launch.ps1 -Preset high -ShowSettings
+```
+
+Use `-VictoryExe 'C:\vt\release\victory.exe'` for a custom build path.
+The launcher accepts any VIctory command via `-VictoryArgs`, so the same
+profile can be used when prebuilding shaders or pipelines.
+
+The tracked profiles are in `presets/*.env`. To override a setting locally,
+create a git-ignored `.env` in the repository root, for example:
+
+```dotenv
+# Only the settings you want to override
+VICTORY_SCRATCH_SPARE_MB=128
+```
+
+Precedence for the three managed variables: local `.env` > selected preset
+> inherited environment. All other environment variables are left alone.
+The launcher accepts plain KEY=VALUE lines, blank lines and whole-line
+comments. It validates the three numeric settings, rejects unknown names
+and duplicate entries, and does not execute file contents. The parent
+PowerShell environment is restored when VIctory exits.
+
+These are memory/performance profiles, not graphics-quality presets.
+Smaller windows may increase overlapping copies; the spare budget is not a
+total memory limit. Buffered reads can change I/O behavior. Test one switch
+at a time, and compare frame times, memory use and rendering. No FPS gain
+is guaranteed. The existing `victory.toml` remains the configuration for
+game, cache and data paths. Debug and rendering-correctness switches are
+not changed by the presets.
+
 ## Commands
 
 ```
