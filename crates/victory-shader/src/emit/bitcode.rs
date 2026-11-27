@@ -297,6 +297,68 @@ impl Module {
         self.constant(ty, Const::Aggregate(ids))
     }
 
+    /// The original i32 of a float made by a bitcast. Do not look through
+    /// arithmetic, sign modifiers, conversions or phi nodes.
+    fn float_source_bits(&self, v: V) -> Option<V> {
+        let V::Inst(i) = v else { return None };
+        let inst = self.insts.get(i as usize)?;
+        if !matches!(self.types[inst.ty.0 as usize], TypeDef::Float) {
+            return None;
+        }
+        let Op::Cast(Cast::Bitcast, source) = &inst.op else { return None };
+        matches!(self.types[self.type_of(*source).0 as usize], TypeDef::Int(32))
+            .then_some(*source)
+    }
+
+    /// Exact bits of a float constant or an i32 constant bitcast to float.
+    fn float_bits(&self, v: V) -> Option<u32> {
+        if let V::Const(i) = v {
+            if let Const::Float(bits) = self.consts[i as usize].1 {
+                return Some(bits);
+            }
+        }
+        self.float_source_bits(v).and_then(|x| self.int_value(x)).map(|x| x as u32)
+    }
+
+    /// An exponent-zero operand (signed zero or denormal) forces +0,
+    /// even against NaN/Inf. Remove only tests proven redundant.
+    pub fn legacy_mul_f32(&mut self, block: usize, a: V, b: V) -> V {
+        const EXP: u32 = 0x7f80_0000;
+        let az = self.float_bits(a).map(|x| x & EXP == 0);
+        let bz = self.float_bits(b).map(|x| x & EXP == 0);
+        if az == Some(true) || bz == Some(true) {
+            return self.f32(0);
+        }
+        let product = self.bin(block, Bin::Mul, a, b);
+        if az == Some(false) && bz == Some(false) {
+            return product;
+        }
+        let same = a == b || self.float_source_bits(a)
+            .is_some_and(|x| self.float_source_bits(b) == Some(x));
+        let exp = self.i32(EXP);
+        let zero = self.i32(0);
+        let i32t = self.int(32);
+        let check = |m: &mut Self, v: V| {
+            let bits = m.float_source_bits(v)
+                .unwrap_or_else(|| m.cast(block, Cast::Bitcast, v, i32t));
+            let e = m.bin(block, Bin::And, bits, exp);
+            m.cmp(block, pred::EQ, e, zero)
+        };
+        let cond = match (az, bz) {
+            (None, None) if same => check(self, a),
+            (None, None) => {
+                let x = check(self, a);
+                let y = check(self, b);
+                self.bin(block, Bin::Or, x, y)
+            }
+            (None, _) => check(self, a),
+            (_, None) => check(self, b),
+            _ => unreachable!("constant operands handled above"),
+        };
+        let fzero = self.f32(0);
+        self.select(block, cond, fzero, product)
+    }
+
     /// The value of an integer constant; `None` for anything else.
     pub fn int_value(&self, v: V) -> Option<i64> {
         match v {
@@ -1214,6 +1276,51 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_mul_constant_exponent_zero_folds_without_product() {
+        let mut m = Module::default();
+        let b = m.new_block();
+        let f32t = m.float();
+        let nan = m.f32(0x7fc0_0000);
+        for bits in [0, 0x8000_0000, 1, 0x807f_ffff] {
+            let integer = m.i32(bits);
+            let operand = m.cast(b, Cast::Bitcast, integer, f32t);
+            let before = m.insts.len();
+            let zero = m.legacy_mul_f32(b, operand, nan);
+            assert_eq!(m.float_bits(zero), Some(0));
+            assert_eq!(m.insts.len(), before);
+            let zero = m.legacy_mul_f32(b, nan, operand);
+            assert_eq!(m.float_bits(zero), Some(0));
+            assert_eq!(m.insts.len(), before);
+        }
+    }
+
+    #[test]
+    fn legacy_mul_elides_only_proven_redundant_checks() {
+        let mut m = Module::default();
+        let b = m.new_block();
+        let i32t = m.int(32);
+        let f32t = m.float();
+        let x = m.phi(b, i32t);
+        let y = m.phi(b, i32t);
+        let a = m.cast(b, Cast::Bitcast, x, f32t);
+        let a_again = m.cast(b, Cast::Bitcast, x, f32t);
+        let other = m.cast(b, Cast::Bitcast, y, f32t);
+        let normal = m.f32(0x0080_0000);
+        let inf = m.f32(0x7f80_0000);
+        for (left, right, comparisons, selects) in [
+            (a, other, 2, 1), (a, a_again, 1, 1),
+            (normal, a, 1, 1), (a, inf, 1, 1), (normal, inf, 0, 0),
+        ] {
+            let start = m.insts.len();
+            let _ = m.legacy_mul_f32(b, left, right);
+            let insts = &m.insts[start..];
+            assert_eq!(insts.iter().filter(|i| matches!(i.op, Op::Cmp(..))).count(), comparisons);
+            assert_eq!(insts.iter().filter(|i| matches!(i.op, Op::Select(..))).count(), selects);
+            assert_eq!(insts.iter().filter(|i| matches!(i.op, Op::Bin(Bin::Mul, ..))).count(), 1);
+        }
+    }
 
     #[test]
     fn vbr_and_blocks() {

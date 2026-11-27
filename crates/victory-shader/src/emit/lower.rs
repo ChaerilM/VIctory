@@ -2504,20 +2504,7 @@ impl<'a> Lower<'a> {
     /// as zero, so the test is on the exponent bits rather than a float
     /// compare (whose result would depend on the host's denormal mode).
     fn legacy_mul(&mut self, a: V, b: V) -> V {
-        let c = self.cur;
-        let m = self.s.m.bin(c, Bin::Mul, a, b);
-        let exp = self.s.m.i32(0x7F80_0000);
-        let izero = self.s.m.i32(0);
-        let is_zero = |l: &mut Self, v: V| {
-            let bits = l.as_int(v);
-            let e = l.s.m.bin(c, Bin::And, bits, exp);
-            l.s.m.cmp(c, pred::EQ, e, izero)
-        };
-        let az = is_zero(self, a);
-        let bz = is_zero(self, b);
-        let z = self.s.m.bin(c, Bin::Or, az, bz);
-        let zero = self.s.m.f32(0);
-        self.s.m.select(c, z, zero, m)
+        self.s.m.legacy_mul_f32(self.cur, a, b)
     }
 
     // ---- lane booleans ----

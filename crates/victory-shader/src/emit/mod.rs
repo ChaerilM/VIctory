@@ -327,7 +327,33 @@ pub struct HostShader {
     pub view_marks: bool,
 }
 
+/// Recognize the PSV0 runtime-info layout emitted by container::psv.
+fn fixed_compute_wave_size(psv: &[u8]) -> Option<u32> {
+    let size = u32::from_le_bytes(psv.get(..4)?.try_into().ok()?) as usize;
+    if size != 48 {
+        return None;
+    }
+    let info = psv.get(4..4 + size)?;
+    if info[24] != 5 {
+        return None;
+    }
+    let min = u32::from_le_bytes(info[16..20].try_into().ok()?);
+    let max = u32::from_le_bytes(info[20..24].try_into().ok()?);
+    (min == max && matches!(min, 32 | 64)).then_some(min)
+}
+
 impl HostShader {
+    /// Exact wave size declared by our emitted compute shader, if known.
+    /// Read PSV0 instead of extending the cached HostShader encoding.
+    /// None means no recognized fixed requirement, not proof of portability.
+    pub fn required_wave_size(&self) -> Option<u32> {
+        if self.stage != HwStage::Cs {
+            return None;
+        }
+        let c = Container::parse(&self.dxil).ok()?;
+        fixed_compute_wave_size(c.part(FourCC::PSV0)?.data)
+    }
+
     /// Size of the user-data buffer the shader declares, in dwords (a
     /// multiple of 4; 0 when it reads none). Root constants must cover it.
     pub fn user_data_dwords(&self) -> u32 {
@@ -636,6 +662,27 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn fixed_compute_wave_size_reads_only_known_psv_layout() {
+        let make = |wave_size| {
+            super::container::psv(&super::container::Psv {
+                stage: 5, flag: false, inputs: &[], outputs: &[], prims: &[],
+                mesh: None, gs: None, bindings: &[], threads: [64, 1, 1], wave_size,
+            })
+        };
+        for wave in [None, Some(32), Some(64)] {
+            let bytes = make(wave);
+            assert_eq!(super::fixed_compute_wave_size(&bytes), wave);
+            assert_eq!(super::fixed_compute_wave_size(&bytes[..30]), None);
+        }
+        let mut bytes = make(Some(64));
+        bytes[28] = 0; // pixel stage
+        assert_eq!(super::fixed_compute_wave_size(&bytes), None);
+        let mut bytes = make(Some(64));
+        bytes[..4].copy_from_slice(&24u32.to_le_bytes());
+        assert_eq!(super::fixed_compute_wave_size(&bytes), None);
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {

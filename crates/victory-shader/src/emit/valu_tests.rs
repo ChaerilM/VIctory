@@ -2281,3 +2281,28 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+
+#[test]
+fn legacy_mul_fastpaths_preserve_zero_and_denormal_semantics() {
+    let square = build_valu_cs(&vop3(0x107, 0, vgpr(1), vgpr(1), vgpr(0)));
+    let cases = [
+        (0x8000_0000, 0), (1, 0), (0x807f_ffff, 0),
+        (0x7f80_0000, 0x7f80_0000), (0xff80_0000, 0x7f80_0000),
+        (0x4040_0000, 0x4110_0000),
+    ];
+    let inputs: Vec<_> = cases.iter().map(|&(a, _)| [a, 0, 0, 0]).collect();
+    run_cases(&square, &inputs, |backend, i, _, got| {
+        assert_eq!(got, cases[i].1, "{backend}: legacy square case {i}");
+    });
+    // Inline zero and 1.0 in either operand.
+    for (constant, is_zero) in [(0x80, true), (242, false)] {
+        for (a, b) in [(constant, vgpr(1)), (vgpr(1), constant)] {
+            let shader = build_valu_cs(&vop3(0x107, 0, a, b, vgpr(0)));
+            let inputs = [[0x807f_ffff, 0, 0, 0], [0x7f80_0000, 0, 0, 0], [0x4000_0000, 0, 0, 0]];
+            run_cases(&shader, &inputs, |backend, i, input, got| {
+                let want = if is_zero || i == 0 { 0 } else { input[0] };
+                assert_eq!(got, want, "{backend}: legacy constant case {i}");
+            });
+        }
+    }
+}
