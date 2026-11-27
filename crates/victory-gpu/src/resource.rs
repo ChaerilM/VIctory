@@ -1581,6 +1581,33 @@ fn evictable(t: &HostTexture) -> bool {
     t.key.is_some() && crate::texture::title_written(&t.texture) && !t.host_written.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Optional soft ceiling for local GPU memory pressure (MiB). Zero or an
+/// invalid value leaves DXGI's dynamic budget as the only limit.
+#[cfg(windows)]
+fn vram_target() -> Option<u64> {
+    static TARGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *TARGET.get_or_init(|| {
+        let target = std::env::var("VICTORY_VRAM_TARGET_MB").ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| (1024..=65536).contains(&v));
+        if let Some(mib) = target {
+            tracing::info!(mib, "soft local GPU memory target enabled");
+        }
+        target
+    })
+}
+
+/// The host reports decimal MB. An optional MiB ceiling lowers the existing
+/// eviction threshold, but never raises it above the driver's current budget.
+/// Keep the existing hysteresis ratio and eviction eligibility.
+#[cfg(windows)]
+fn eviction_excess(used: f64, budget: f64, target_mib: Option<u64>) -> u64 {
+    let high = BUDGET_HIGH * budget;
+    let high = target_mib.map_or(high, |mib| high.min(mib as f64 * 1_048_576.0 / 1e6));
+    let low = if target_mib.is_some() { high * (BUDGET_LOW / BUDGET_HIGH) } else { BUDGET_LOW * budget };
+    if used > high { ((used - low) * 1e6) as u64 } else { 0 }
+}
+
 /// Once per presented frame, before a submission (`Host::execute`, one at a
 /// time, the last one has run): gives up host textures fed from title memory
 /// that the title has not used for [`IDLE_MS`], and past [`BUDGET_HIGH`] of
@@ -1597,7 +1624,7 @@ pub(crate) fn evict_unused() {
         // Free space in the heaps of textures takes the card's memory but
         // is not in use: new textures go there first.
         let used = used - crate::placement::free_bytes() as f64 / 1e6;
-        if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
+        eviction_excess(used, budget, vram_target())
     });
     evict(frame, now_ms(), over);
 }
@@ -2489,6 +2516,16 @@ mod tests {
         assert_eq!(choose(&uses, frame, now, 1 << 20), vec![1, 2, 0], "all of them if need be");
         let early = (frame - 1, now - IDLE_MS, 10);
         assert!(choose(&[early], frame, now, 0).is_empty(), "too few frames ago");
+    }
+
+    #[test]
+    fn vram_target_only_lowers_the_dynamic_eviction_threshold() {
+        assert_eq!(eviction_excess(899.0, 1000.0, None), 0);
+        assert_eq!(eviction_excess(950.0, 1000.0, None), 100_000_000);
+        assert_eq!(eviction_excess(950.0, 1000.0, Some(5120)), 100_000_000);
+        assert_eq!(eviction_excess(5300.0, 10000.0, Some(5120)), 0);
+        assert!(eviction_excess(5500.0, 10000.0, Some(5120)) > 0);
+        assert_eq!(eviction_excess(5500.0, 10000.0, None), 0);
     }
 
     /// Title textures of one memory share a key in any format of the same

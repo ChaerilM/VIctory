@@ -1,7 +1,7 @@
 # Apply authored numeric performance settings without evaluating .env text.
 [CmdletBinding()]
 param(
-    [ValidateSet('default', 'low', 'high')]
+    [ValidateSet('default', 'low', 'high', '8gb', '12gb', '16gb')]
     [string]$Preset = 'default',
     [string]$VictoryExe,
     [string[]]$VictoryArgs,
@@ -17,7 +17,8 @@ if (-not $VictoryExe) {
 $names = @(
     'VICTORY_WINDOW_KB',
     'VICTORY_SCRATCH_SPARE_MB',
-    'VICTORY_BUFFERED_TITLE_READS'
+    'VICTORY_BUFFERED_TITLE_READS',
+    'VICTORY_VRAM_TARGET_MB'
 )
 
 function Read-PerformanceEnv([string]$Path) {
@@ -48,6 +49,13 @@ function Read-PerformanceEnv([string]$Path) {
                 $mb = 0
                 if (-not [int]::TryParse($value, [ref]$mb) -or $mb -gt 512) {
                     throw "$name must be between 0 and 512"
+                }
+                $value = $mb.ToString()
+            }
+            'VICTORY_VRAM_TARGET_MB' {
+                $mb = 0
+                if (-not [int]::TryParse($value, [ref]$mb) -or ($mb -ne 0 -and ($mb -lt 1024 -or $mb -gt 65536))) {
+                    throw "$name must be 0 (automatic) or between 1024 and 65536"
                 }
                 $value = $mb.ToString()
             }

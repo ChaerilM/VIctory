@@ -149,7 +149,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
     // Only the checked-in, authored numeric presets are allowed, not
     // arbitrary local .env files (which may contain private configuration).
-    let preset = matches!(path, "presets/default.env" | "presets/low.env" | "presets/high.env");
+    let preset = matches!(path, "presets/default.env" | "presets/low.env" | "presets/high.env" | "presets/8gb.env" | "presets/12gb.env" | "presets/16gb.env");
     let allowed = preset || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn only_named_env_presets_are_allowed() {
-        for path in ["presets/default.env", "presets/low.env", "presets/high.env"] {
+        for path in ["presets/default.env", "presets/low.env", "presets/high.env", "presets/8gb.env", "presets/12gb.env", "presets/16gb.env"] {
             assert!(check(path, b"VICTORY_WINDOW_KB=1024\n").is_empty());
             assert!(!check(path, b"\0").is_empty());
         }
