@@ -2413,6 +2413,78 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
 }
 
+/// Opt in per process. Avoid changing existing timing and scheduling by
+/// default; no GPU/CPU overlap or allocation placement changes.
+fn wide_refresh() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let enabled = std::env::var("VICTORY_WIDE_REFRESH").as_deref() == Ok("1");
+        if enabled {
+            tracing::info!("parallel buffer refresh enabled (VICTORY_WIDE_REFRESH=1)");
+        }
+        enabled
+    })
+}
+
+type Refresh = (std::sync::Arc<crate::shadow::Shadow>, usize, usize);
+
+/// A batch of independent copies is worth dispatching only for substantial
+/// work. Exclude touching title pages (not just overlapping byte ranges).
+/// Physical aliases are handled by the existing synchronized watch code.
+fn wide_ranges(ranges: impl Iterator<Item = (usize, usize)>) -> bool {
+    use crate::watch::PAGE;
+    let mut pages = Vec::new();
+    let mut bytes = 0usize;
+    for (a, b) in ranges {
+        if a >= b {
+            return false;
+        }
+        bytes = bytes.saturating_add(b - a);
+        pages.push((a / PAGE, b.div_ceil(PAGE)));
+    }
+    if pages.len() < 4 || bytes < 1 << 20 {
+        return false;
+    }
+    pages.sort_unstable();
+    pages.windows(2).all(|w| w[0].1 <= w[1].0)
+}
+
+fn refresh_one((shadow, from, to): &Refresh) -> (usize, u64) {
+    let started = Instant::now();
+    let copied = shadow.update(*from, *to - *from);
+    let us = started.elapsed().as_micros() as u64;
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::range(*from, *to - *from, us, 0);
+    (copied, us)
+}
+
+fn refresh_serial(work: &[Refresh]) -> usize {
+    let mut total = 0;
+    for job in work {
+        let (copied, us) = refresh_one(job);
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        total += copied;
+    }
+    total
+}
+
+fn refresh_wide(work: &[Refresh]) -> usize {
+    use std::sync::atomic::AtomicUsize;
+    let started = Instant::now();
+    let total = AtomicUsize::new(0);
+    // Same capped, scoped worker policy as texture uploads. Each index
+    // is visited once; the scope joins before the next deferred step.
+    crate::texture::in_parallel(work.len(), |i| {
+        let (copied, _) = refresh_one(&work[i]);
+        total.fetch_add(copied, Ordering::Relaxed);
+    });
+    let copied = total.into_inner();
+    PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+    copied
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         // Nothing to copy: a world submission asks for every copy its heaps'
@@ -2445,19 +2517,44 @@ impl Batch {
 
     /// Does the refreshes; returns the bytes copied.
     fn flush(&mut self) -> usize {
+        self.flush_with(wide_refresh())
+    }
+
+    fn flush_with(&mut self, wide: bool) -> usize {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
+        // The pending map guarantees at most one range per Shadow.
+        // Never run two jobs for a copy, split its tracker, or move a job
+        // across a serial one. Existing flush boundaries stay untouched.
         let mut total = 0;
+        if wide {
+            let work = &self.refreshes;
+            let eligible = |job: &Refresh| {
+                job.2.saturating_sub(job.1) >= crate::watch::PAGE
+                    && job.0.wide_refresh_ok()
+            };
+            let mut i = 0;
+            while i < work.len() {
+                let yes = eligible(&work[i]);
+                let mut end = i + 1;
+                while end < work.len() && eligible(&work[end]) == yes {
+                    end += 1;
+                }
+                let group = &work[i..end];
+                total += if yes && wide_ranges(group.iter().map(|(_, a, b)| (*a, *b))) {
+                    refresh_wide(group)
+                } else {
+                    refresh_serial(group)
+                };
+                i = end;
+            }
+        } else {
+            total = refresh_serial(&self.refreshes);
+        }
+        // No deferred step observes current until every update is done.
+        // Keep the original order and coverage bookkeeping.
         for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-            total += copied;
             // Kept: the union with what was current if they touch, else
             // the larger.
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
@@ -3932,7 +4029,69 @@ fn pump() {
 
 #[cfg(test)]
 mod batch {   // `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, wide_ranges};
+
+    #[test]
+    fn wide_refresh_rejects_small_and_overlapping_batches() {
+        let p = crate::watch::PAGE;
+        let ranges = [(0, 4*p), (4*p, 8*p), (8*p, 12*p), (12*p, 16*p)];
+        assert!(wide_ranges(ranges.into_iter()));
+        assert!(!wide_ranges(ranges[..3].iter().copied()));
+        assert!(!wide_ranges([(0, p), (p, 2*p), (2*p, 3*p), (3*p, 4*p)].into_iter()));
+        let mut overlapping = ranges;
+        overlapping[1].0 -= 1;
+        assert!(!wide_ranges(overlapping.into_iter()));
+        let shared_page = [(0, 4*p-2), (4*p-1, 9*p), (9*p, 13*p), (13*p, 17*p)];
+        assert!(!wide_ranges(shared_page.into_iter()));
+        assert!(!wide_ranges([(0, 0), ranges[1], ranges[2], ranges[3]].into_iter()));
+    }
+
+    #[test]
+    fn wide_refresh_keeps_dedup_and_title_write_boundaries() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else { return };
+        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let pages = 4;
+        let len = pages * PAGE;
+        let pools = [(); 4].map(|_| crate::watch::tests::pool(pages));
+        for (i, &p) in pools.iter().enumerate() {
+            // SAFETY: fresh test allocation of len bytes.
+            unsafe { std::ptr::write_bytes(p as *mut u8, (i+1) as u8, len) };
+            crate::shadow::register(p, p as u64, len as u64);
+        }
+        let copies: Vec<_> = pools.iter().map(|&p| crate::shadow::find(p as u64, len as u64).unwrap()).collect();
+        let mut batch = Batch::default();
+        let add = |batch: &mut Batch| {
+            for (&p, copy) in pools.iter().zip(&copies) {
+                batch.add(copy, p, len);
+                batch.add(copy, p + PAGE, PAGE);
+            }
+        };
+        add(&mut batch);
+        assert_eq!(batch.refreshes.len(), 4);
+        assert!(wide_ranges(batch.refreshes.iter().map(|(_, a, b)| (*a, *b))));
+        assert!(batch.refreshes.iter().all(|(s, _, _)| s.wide_refresh_ok()));
+        assert_eq!(batch.flush_with(true), 4*len);
+        for (i, (&p, copy)) in pools.iter().zip(&copies).enumerate() {
+            assert_eq!(copy.read_host(p as u64, 1), [0x01010101 * (i as u32 + 1)]);
+            // SAFETY: the test owns the title mapping, watched since refresh.
+            unsafe { ((p + PAGE) as *mut u32).write_volatile(0xaabbccdd) };
+        }
+        add(&mut batch);
+        assert_eq!(batch.flush_with(true), 0, "already refreshed in this epoch");
+        batch.title_written();
+        add(&mut batch);
+        assert_eq!(batch.flush_with(true), 4*PAGE);
+        for (&p, copy) in pools.iter().zip(&copies) {
+            assert_eq!(copy.read_host((p + PAGE) as u64, 1), [0xaabbccdd]);
+        }
+        drop(batch);
+        for (&p, copy) in pools.iter().zip(copies) {
+            crate::shadow::unregister(p, p as u64);
+            drop(copy);
+            crate::watch::tests::free(p);
+        }
+    }
 
     /// A host copy of tracked title memory: a submission whose lists all ask
     /// for it whole copies the one page the title wrote, once, and again

@@ -133,7 +133,8 @@ fn give_back(v: Vec<u8>) {
 const POOL_BYTES: usize = 512 << 20;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
-// written only on the submitting thread.
+// written only under the submission's serialization. A wide refresh assigns
+// each dedicated copy to at most one worker, joined before any later step.
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
@@ -536,6 +537,14 @@ impl Shadow {
     /// it (tracked memory only): [`Shadow::update`] would copy nothing.
     pub(crate) fn clean(&self) -> bool {
         self.tracked.as_ref().is_some_and(crate::watch::Tracked::clean)
+    }
+
+    /// Dedicated mappings without pending GPU writes can be refreshed in
+    /// parallel with other independent copies. Shared view arenas and any
+    /// copy with a live write declaration remain on the submitting thread.
+    pub(crate) fn wide_refresh_ok(&self) -> bool {
+        self.slice.is_none()
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Its tracker's bit: `crate::watch::clean_bit` of it is
