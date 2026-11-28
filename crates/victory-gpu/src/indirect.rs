@@ -6,6 +6,7 @@
 //! just before its execution, by a compute shader of ours (HLSL compiled by
 //! the system's compiler; a 5.1 shader with its root signature inside).
 //!
+//! Counted calls clamp only the active GPU count, not the unused tail.
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
 //! so a list of thousands of garbage records cannot run for seconds
@@ -24,8 +25,9 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u1), UAV(u0)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u1), UAV(u0), SRV(t1)"
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint has_count; };
+ByteAddressBuffer count_buf : register(t1);
 // The title's records, read only; the clamped ones go to the list's own.
 ByteAddressBuffer args : register(t0);
 RWByteAddressBuffer dest : register(u0);
@@ -71,6 +73,7 @@ uint clamped(uint at) {
 // A record past the budget (no cost reaches it).
 static const uint PAST = 0xffffffffu;
 groupshared uint costs[64];
+groupshared uint active_records;
 // One group walks the records in tiles of 64: every lane clamps its own
 // record, then the first lane charges the tile's records in order. No
 // other group shares the budget: a shared add wraps once enough records
@@ -78,15 +81,46 @@ groupshared uint costs[64];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint lane : SV_GroupIndex) {
+    // The common one-record call needs neither shared memory nor a
+    // group rendezvous. It charges exactly the same ordered budget.
+    if (records == 1) {
+        if (lane == 0) {
+            [branch]
+            if (has_count != 0) {
+                if (count_buf.Load(0) == 0) {
+                    dest.Store(0, 0);
+                    return;
+                }
+            }
+            uint remaining = BUDGET - min(budget.Load(0), BUDGET);
+            uint cost = clamped(0);
+            if (cost > remaining) {
+                dest.Store(0, 0);
+                remaining = 0;
+            } else {
+                remaining -= cost;
+            }
+            budget.Store(0, BUDGET - remaining);
+        }
+        return;
+    }
     uint left = 0;
+    uint active = records;
+    if (has_count != 0) {
+        if (lane == 0) {
+            active_records = min(records, count_buf.Load(0));
+        }
+        GroupMemoryBarrierWithGroupSync();
+        active = active_records;
+    }
     if (lane == 0) {
         left = BUDGET - min(budget.Load(0), BUDGET);
     }
-    for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
+    for (uint tile = 0; tile < active / 64 + min(active % 64, 1u); tile++) {
         uint record = tile * 64 + lane;
         uint at = record * stride;
         uint cost = 0;
-        if (record < records) {
+        if (record < active) {
             cost = clamped(at);
         }
         costs[lane] = cost;
@@ -104,9 +138,14 @@ void main(uint lane : SV_GroupIndex) {
             }
         }
         GroupMemoryBarrierWithGroupSync();
-        if (costs[lane] == PAST) {
+        if (record < active && costs[lane] == PAST) {
             // Draws keep their layout with no vertices; groups become zero.
             dest.Store(at, 0);
+        }
+        // No lane may overwrite costs for the next tile before all
+        // lanes have consumed the current tile's rejection decision.
+        if (tile + 1 < active / 64 + min(active % 64, 1u)) {
+            GroupMemoryBarrierWithGroupSync();
         }
     }
     if (lane == 0) {
@@ -203,16 +242,36 @@ fn make() -> windows::core::Result<Clamp> {
 // promoted to a write state the input assembler may not use (the debug
 // layer cannot see view accesses; GPU-based validation might); upgrade to
 // per-list tracked buffer states if a driver or that validation minds.
-pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u32, u32)) -> Option<ID3D12Resource> {
+/// Validate before allocating or recording: the shader uses 32-bit byte
+/// addresses. Unknown kinds and too-short records must not read past a view.
+fn argument_bytes(gpu: u64, count_gpu: Option<u64>, (kind, stride, records): (u32, u32, u32)) -> Option<u64> {
+    let min = match kind { 0 => 16, 1 => 20, 2 | 10 => 12, _ => return None };
+    if gpu == 0 || !gpu.is_multiple_of(4) || stride < min || !stride.is_multiple_of(4)
+        || count_gpu.is_some_and(|at| at == 0 || !at.is_multiple_of(4)) {
+        return None;
+    }
+    let bytes = u64::from(stride) * u64::from(records.max(1));
+    (bytes <= u64::from(u32::MAX)).then_some(bytes)
+}
+
+#[cfg(test)]
+fn bound(list: &HostList, gpu: u64, spec: (u32, u32, u32)) -> Option<ID3D12Resource> {
+    bound_count(list, gpu, None, spec)
+}
+
+pub(crate) fn bound_count(
+    list: &HostList,
+    gpu: u64,
+    count_gpu: Option<u64>,
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<ID3D12Resource> {
+    let bytes = argument_bytes(gpu, count_gpu, (kind, stride, records))?;
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return None;
     };
-    if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
-        return None;
-    }
-    let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
+    let out = list.arguments(bytes)?;
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
+    let constants = [kind, stride, records, u32::from(count_gpu.is_some())];
     // SAFETY: an open list; our root signature, pipeline and buffers, and
     // a title buffer's copy the caller's list holds.
     unsafe {
@@ -227,7 +286,10 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
         l.SetComputeRootShaderResourceView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
-        // One group walks every record.
+        // Always bind a valid root SRV, even without a count. The shader
+        // does not read it in that case.
+        l.SetComputeRootShaderResourceView(4, count_gpu.unwrap_or(gpu));
+        // One group walks every active record in order.
         l.Dispatch(records.min(1), 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),
@@ -261,6 +323,72 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn indirect_layout_checks_kind_stride_alignment_and_overflow() {
+        use super::argument_bytes as bytes;
+        assert_eq!(bytes(0x1000, Some(0x2000), (1, 20, 4)), Some(80));
+        assert_eq!(bytes(0x1000, None, (2, 12, 0)), Some(12));
+        for spec in [(7, 12, 1), (0, 12, 1), (1, 16, 1), (2, 13, 1), (10, 12, u32::MAX)] {
+            assert_eq!(bytes(0x1000, None, spec), None);
+        }
+        assert_eq!(bytes(0x1002, None, (2, 12, 1)), None);
+        assert_eq!(bytes(0x1000, Some(0x2002), (2, 12, 1)), None);
+    }
+
+    /// Counted tails must not consume the next execution's budget.
+    #[test]
+    fn counted_indirect_charges_only_active_records() {
+        let Some(host) = super::host() else { return };
+        let (src, data) = host.shared_buffer(65536).unwrap();
+        let (counter, count) = host.shared_buffer(65536).unwrap();
+        // Each draw costs 2^26. One active draw plus a second single
+        // draw fits exactly; a third single draw must be rejected.
+        let list = host.new_list().unwrap();
+        // SAFETY: live mappings; all commands finish before readback.
+        unsafe {
+            for i in 0..4 {
+                data.cast::<[u32; 4]>().add(i).write([1 << 24, 4, 7, 9]);
+            }
+            count.cast::<u32>().write(1);
+            let gpu = src.GetGPUVirtualAddress();
+            let cg = counter.GetGPUVirtualAddress();
+            let out = super::bound_count(&list, gpu, Some(cg), (0, 16, 4)).unwrap();
+            super::done(&list, &out);
+            let out = super::bound(&list, gpu, (0, 16, 1)).unwrap();
+            super::done(&list, &out);
+            // Read each result after its own command: a third call would
+            // overwrite the same scratch buffer. Copy the second result
+            // into a separate readback buffer before that call.
+            let (read, mapped) = host.shared_buffer(65536).unwrap();
+            list.list.ResourceBarrier(&[super::transition(&out,
+                super::D3D12_RESOURCE_STATE_COMMON, super::D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.list.CopyBufferRegion(&read, 0, &out, 0, 16);
+            list.list.ResourceBarrier(&[super::transition(&out,
+                super::D3D12_RESOURCE_STATE_COPY_SOURCE, super::D3D12_RESOURCE_STATE_COMMON)]);
+            let last = super::bound(&list, gpu, (0, 16, 1)).unwrap();
+            super::done(&list, &last);
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(mapped.cast::<[u32; 4]>().read(), [1 << 24, 4, 7, 9]);
+            let mut ptr = std::ptr::null_mut();
+            last.Map(0, None, Some(&mut ptr)).unwrap();
+            assert_eq!(ptr.cast::<u32>().read(), 0);
+            last.Unmap(0, None);
+            assert_eq!(count.cast::<u32>().read(), 1);
+            assert_eq!(data.cast::<[u32; 4]>().read(), [1 << 24, 4, 7, 9]);
+        }
+    }
+
+    #[test]
+    fn single_record_fast_path_keeps_bounds_and_budget() {
+        let Some(first) = clamped(0, &[u32::MAX], 1, 1) else { return };
+        assert_eq!(first, [1 << 24]);
+        assert_eq!(clamped(0, &[u32::MAX], 1, 2).unwrap(), [1 << 24]);
+        assert_eq!(clamped(0, &[u32::MAX], 1, 3).unwrap(), [0]);
+        assert_eq!(clamped(2, &[70_000, 1, 1], 1, 1).unwrap(), [65_535]);
+        assert_eq!(clamped(10, &[70_000, 1, 1], 1, 1).unwrap(), [65_535]);
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
