@@ -1764,7 +1764,10 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max)) else {
+        // The clamp reads the same GPU count as ExecuteIndirect, after
+        // earlier argument-producing work, so inactive records cost nothing.
+        let count_gpu = counter.as_ref().map(|(s, at)| s.gpu(*at));
+        let Some(clamped) = crate::indirect::bound_count(list, args.gpu(arguments), count_gpu, (kind, stride, max)) else {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         };
