@@ -18,7 +18,9 @@ even larger-capacity adapters when enabled; use it only for testing.
 The second half of the stride table maps logical indices to physical
 places. Only createHandleFromHeap reads that mapping; stride, mark,
 address and read-feedback indices stay logical. Raw null SRV/UAV
-indices are mapped to separate physical nulls. Host-created memory
+indices are mapped to separate physical nulls. Missing buffer places
+also select the raw null SRV/UAV even with stale stride metadata (typed
+null compatibility still requires GPU validation). Host-created memory
 view pairs use the dynamic region. The shader cache fingerprint and
 pipeline warm-up tag include the process setting.
 

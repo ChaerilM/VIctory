@@ -88,7 +88,7 @@ pub(crate) fn near_heaps(va: u64) -> String {
 
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
-const PORTABLE_VIEWS: u32 = 1_000_000;
+const PORTABLE_VIEWS: u32 = victory_shader::emit::REMAP_PHYSICAL_VIEWS;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
@@ -923,6 +923,8 @@ impl HostHeap {
         if !p.pooled(index) {
             return false;
         }
+        self.set_stride(index, None);
+        self.set_mark(index, None);
         self.write_place(index, p.physical - 1);
         p.retire(index, completed());
         true

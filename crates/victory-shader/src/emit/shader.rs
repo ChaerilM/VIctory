@@ -32,6 +32,8 @@ pub const MEMORY_SPACE: u32 = 2;
 /// indices").
 pub const HEAP_VIEWS: u32 = 1 << 21;
 pub const HEAP_SAMPLERS: u32 = 2048;
+/// The fixed physical capacity in experimental remap mode.
+pub const REMAP_PHYSICAL_VIEWS: u32 = 1_000_000;
 
 /// Process-wide opt-in. Both host allocation and translation consult the
 /// same immutable setting, including offline cache warm-up.
@@ -555,7 +557,17 @@ impl Shader {
         // Keep the logical index for marks, strides and read feedback;
         // only the actual heap handle takes the physical place.
         let physical = if !sampler && view_remap() {
-            self.view_place(block, index)
+            let place = self.view_place(block, index);
+            // An unmapped place must not turn a buffer access into a
+            // texture descriptor access, even if metadata is stale.
+            if (10..=12).contains(&(props.0 & 0xff)) {
+                let missing = self.m.i32(REMAP_PHYSICAL_VIEWS - 1);
+                let null = self.m.i32(REMAP_PHYSICAL_VIEWS - 2 - u32::from(props.0 & 0x1000 != 0));
+                let absent = self.m.cmp(block, pred::EQ, place, missing);
+                self.m.select(block, absent, null, place)
+            } else {
+                place
+            }
         } else {
             index
         };
