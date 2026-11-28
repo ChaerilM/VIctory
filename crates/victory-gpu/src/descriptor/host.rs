@@ -23,6 +23,8 @@ pub(crate) struct HostHeap {
     /// where the host takes them, else [`MIN_DYNAMIC`].
     dynamic: u32,
     sampler: bool,
+    /// Logical title slots on a fixed-capacity physical heap.
+    places: Option<Mutex<Places>>,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
@@ -99,6 +101,106 @@ const DYNAMIC: u32 = 1 << 18;
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+// Retire a place against a completed submission, not a FIFO age guess.
+// Only Host::execute advances this after GPU completion under its lock.
+static COMPLETED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn submission_completed() {
+    COMPLETED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn completed() -> u64 {
+    COMPLETED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Fixed prefix, pooled title slots, contiguous dynamic slots and three
+/// reserved null descriptors at the physical end. Logical metadata stays
+/// indexed by the title's original index. No shared writable sink.
+struct Places {
+    prefix: u32,
+    count: u32,
+    dynamic: u32,
+    physical: u32,
+    dynamic_at: u32,
+    of: Vec<Option<u32>>,
+    free: std::collections::VecDeque<u32>,
+    retired: Vec<(u64, u32)>,
+}
+
+impl Places {
+    fn new(count: u32, dynamic: u32, physical: u32, prefix: u32) -> Option<Self> {
+        use victory_shader::emit::HEAP_VIEWS;
+        if count.checked_add(dynamic)? > HEAP_VIEWS - 3 {
+            return None;
+        }
+        let dynamic_at = physical.checked_sub(3)?.checked_sub(dynamic)?;
+        let prefix = count.min(prefix);
+        if prefix > dynamic_at {
+            return None;
+        }
+        Some(Self {
+            prefix, count, dynamic, physical, dynamic_at,
+            of: vec![None; (count - prefix) as usize],
+            free: (prefix..dynamic_at).collect(),
+            retired: Vec::new(),
+        })
+    }
+
+    fn pooled(&self, index: u32) -> bool {
+        index >= self.prefix && index < self.count
+    }
+
+    fn place(&self, index: u32) -> u32 {
+        use victory_shader::emit::NULL_BUFFER_VIEW;
+        if index < self.prefix {
+            index
+        } else if self.pooled(index) {
+            self.of[(index - self.prefix) as usize].unwrap_or(self.physical - 1)
+        } else if index >= self.count && index < self.count + self.dynamic {
+            self.dynamic_at + index - self.count
+        } else if index == NULL_BUFFER_VIEW {
+            self.physical - 2
+        } else if index == NULL_BUFFER_VIEW - 1 {
+            self.physical - 3
+        } else {
+            self.physical - 1
+        }
+    }
+
+    fn reserve(&mut self, index: u32, now: u64) -> Option<u32> {
+        if !self.pooled(index) {
+            return (index < self.prefix).then_some(index);
+        }
+        let at = (index - self.prefix) as usize;
+        if let Some(place) = self.of[at] {
+            return Some(place);
+        }
+        if self.free.is_empty() {
+            let free = &mut self.free;
+            self.retired.retain(|&(epoch, place)| {
+                if epoch < now {
+                    free.push_back(place);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        let place = self.free.pop_front()?;
+        self.of[at] = Some(place);
+        Some(place)
+    }
+
+    fn retire(&mut self, index: u32, now: u64) {
+        if self.pooled(index)
+            && let Some(place) = self.of[(index - self.prefix) as usize].take()
+        {
+            self.retired.push((now, place));
+        }
+    }
+}
+
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -119,11 +221,17 @@ impl HostHeap {
                     })
             }
         };
+        let remap = !sampler && victory_shader::emit::view_remap();
+        let places = if remap {
+            Some(Places::new(count, DYNAMIC, PORTABLE_VIEWS, 1 << 16)?)
+        } else {
+            None
+        };
         // Every slot a shader can index (title slots, also past a capped
         // heap, and dynamic ones): shaders read the table as a root view,
         // which has no bounds, at indices clamped below `HEAP_VIEWS`.
         let strides = (!sampler)
-            .then(|| host.upload_buffer(u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 4))
+            .then(|| host.upload_buffer(u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * if remap { 8 } else { 4 }))
             .flatten()
             .map(|(buffer, data)| (buffer, data as usize));
         let marks = (!sampler)
@@ -142,7 +250,13 @@ impl HostHeap {
         // Translated shaders clamp their indices below `HEAP_VIEWS` or
         // `HEAP_SAMPLERS`: slots up to there exist and stay null.
         let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
-        let (heap, count, extra) = if sampler {
+        if remap && (strides.is_none() || marks.is_none()) {
+            tracing::warn!("view remap metadata allocation failed");
+            return None;
+        }
+        let (heap, count, extra) = if remap {
+            (make(PORTABLE_VIEWS).ok()?, count, DYNAMIC)
+        } else if sampler {
             match make(count.max(samplers)) {
                 Ok(heap) => (heap, count, 0),
                 Err(e) => {
@@ -194,14 +308,15 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
+            places: places.map(Mutex::new),
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new(DynamicSlots::new(extra as usize)),
             pairs: Mutex::new((count + extra, Vec::new())),
-            pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
+            pairs_end: if remap { count + extra } else { match victory_shader::emit::NULL_BUFFER_VIEW {
                 null if !sampler && null > count + extra && null < total => null - 1,
                 _ => total,
-            },
+            } },
             strides,
             marks,
             addresses: std::sync::OnceLock::new(),
@@ -217,13 +332,17 @@ impl HostHeap {
         let started = std::time::Instant::now();
         if let Err(e) = h.fill_null(kind, total) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
+            if remap { return None; }
+        }
+        if remap {
+            h.init_places();
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
         // What shaders read instead of a slot without a buffer view where
         // they take one at a computed index (`victory_shader::emit`, "Buffer
         // views at computed heap indices"): a null raw SRV, and UAV below it.
         let null = victory_shader::emit::NULL_BUFFER_VIEW;
-        if !sampler && null > count + extra && null < total {
+        if remap || !sampler && null > count + extra && null < total {
             h.raw_view_at(null, None, 0, 0, false);
             h.raw_view_at(null - 1, None, 0, 0, true);
         } else if !sampler {
@@ -263,7 +382,7 @@ impl HostHeap {
             let mut done = 0;
             while done < total {
                 let n = BLOCK.min(total - done);
-                host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
+                host.device.CopyDescriptorsSimple(n, self.cpu_at(done), start, kind);
                 done += n;
             }
         }
@@ -544,7 +663,7 @@ impl HostHeap {
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
             self.null_sampler(index);
-        } else {
+        } else if !self.retire_place(index) {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
@@ -659,7 +778,11 @@ impl HostHeap {
     /// The slots the view addresses have an entry for: the title's and the
     /// dynamic ones.
     fn address_slots(&self) -> u32 {
-        self.count + self.dynamic
+        if self.places.is_some() {
+            victory_shader::emit::HEAP_VIEWS
+        } else {
+            self.count + self.dynamic
+        }
     }
 
     /// Slot `index` now holds `view` (or no view): its view address.
@@ -742,14 +865,67 @@ impl HostHeap {
         // SAFETY: a live shader-visible heap.
         let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start.ptr + u64::from(index) * u64::from(self.step),
+            ptr: start.ptr + u64::from(self.place(index)) * u64::from(self.step),
         }
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        self.cpu_at(self.place(index))
+    }
+
+    fn cpu_at(&self, place: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
-            ptr: self.cpu + index as usize * self.step as usize,
+            ptr: self.cpu + place as usize * self.step as usize,
         }
+    }
+
+    fn place(&self, index: u32) -> u32 {
+        self.places.as_ref().map_or(index, |p| p.lock().unwrap_or_else(|e| e.into_inner()).place(index))
+    }
+
+    fn write_place(&self, index: u32, place: u32) {
+        use victory_shader::emit::HEAP_VIEWS;
+        if let Some((_, data)) = &self.strides
+            && self.places.is_some() && index < HEAP_VIEWS
+        {
+            // SAFETY: remapped heaps allocate two HEAP_VIEWS dword tables.
+            unsafe { (*data as *mut u32).add((HEAP_VIEWS + index) as usize).write_volatile(place) };
+        }
+    }
+
+    fn init_places(&self) {
+        use victory_shader::emit::HEAP_VIEWS;
+        let Some((_, data)) = &self.strides else { return };
+        let Some(p) = &self.places else { return };
+        let p = p.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the fresh mapping holds both complete tables.
+        unsafe { std::ptr::write_bytes(*data as *mut u32, 0, HEAP_VIEWS as usize) };
+        for index in 0..HEAP_VIEWS {
+            self.write_place(index, p.place(index));
+        }
+    }
+
+    /// Only called under the made lock for title slots. Do not publish a
+    /// new place to shaders until the descriptor and metadata are written.
+    fn reserve_place(&self, index: u32) -> Option<u32> {
+        match &self.places {
+            Some(p) => p.lock().unwrap_or_else(|e| e.into_inner()).reserve(index, completed()),
+            None => Some(index),
+        }
+    }
+
+    /// A pooled title slot can be hidden without touching its old physical
+    /// descriptor. No reuse until a GPU-complete submission; keep() retires
+    /// its resource through the existing submission retirement path.
+    fn retire_place(&self, index: u32) -> bool {
+        let Some(p) = &self.places else { return false };
+        let mut p = p.lock().unwrap_or_else(|e| e.into_inner());
+        if !p.pooled(index) {
+            return false;
+        }
+        self.write_place(index, p.physical - 1);
+        p.retire(index, completed());
+        true
     }
 
     /// A heap sync of slots `first..last`, whose records are at `start` +
@@ -880,14 +1056,31 @@ impl HostHeap {
                 crate::shadow::forget_read(index);
             }
             made[index as usize] = key;
+            let pooled = self.places.as_ref().is_some_and(|p| p.lock().unwrap_or_else(|e| e.into_inner()).pooled(index));
+            // Deferred textures need no pool place until read. If a
+            // previously mapped slot is hidden, retire its physical place.
+            let place = if later && pooled { None } else { self.reserve_place(index) };
             let (kept, mark) = if later {
                 (None, None)
+            } else if let Some(place) = place {
+                make_marked(&view, self.cpu_at(place))
             } else {
-                make_marked(&view, self.cpu(index))
+                // Retry on a later sync; never write into the shared null.
+                made[index as usize] = 0;
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!("view remap pool exhausted; unmapped slots read null"));
+                (None, None)
             };
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
+                if pooled {
+                    self.set_stride(index, None);
+                    self.retire_place(index);
+                } else if let Some(place) = place {
+                    null_for(&view, self.cpu_at(place));
+                }
+            } else if let Some(place) = place {
+                self.write_place(index, place);
             }
             if !self.sampler {
                 self.viewed.set(index, Some(&view), kept.is_some());
@@ -944,9 +1137,14 @@ impl HostHeap {
         for index in slots {
             let key = made.get(index as usize).copied().unwrap_or(0);
             let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
-            match &view {
-                Some(v) => null_for(v, self.cpu(index)),
-                None => null_view(self.cpu(index)),
+            if self.retire_place(index) {
+                self.set_stride(index, None);
+                self.set_mark(index, None);
+            } else {
+                match &view {
+                    Some(v) => null_for(v, self.cpu(index)),
+                    None => null_view(self.cpu(index)),
+                }
             }
             self.keep(index, None);
             if index < self.count {
@@ -2288,7 +2486,8 @@ mod tests {
         // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
         // SAFETY: plain queries of live heaps.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            let min = if victory_shader::emit::view_remap() { PORTABLE_VIEWS } else { victory_shader::emit::HEAP_VIEWS };
+            assert!(heap.heap.GetDesc().NumDescriptors >= min);
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }
@@ -2345,6 +2544,30 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn remap_places_preserve_prefix_dynamic_and_null_ranges() {
+        use victory_shader::emit::{HEAP_VIEWS, NULL_BUFFER_VIEW};
+        let mut p = Places::new(14, 4, 12, 2).unwrap();
+        assert_eq!(p.place(0), 0);
+        assert_eq!(p.place(1), 1);
+        assert_eq!(p.place(14), 5);
+        assert_eq!(p.place(17), 8);
+        assert_eq!(p.place(NULL_BUFFER_VIEW - 1), 9);
+        assert_eq!(p.place(NULL_BUFFER_VIEW), 10);
+        assert_eq!(p.place(HEAP_VIEWS - 1), 11);
+        assert_eq!(p.reserve(3, 0), Some(2));
+        assert_eq!(p.reserve(7, 0), Some(3));
+        assert_eq!(p.reserve(13, 0), Some(4));
+        assert_eq!(p.reserve(4, 0), None);
+        p.retire(7, 0);
+        assert_eq!(p.place(7), 11);
+        assert_eq!(p.reserve(4, 0), None, "cannot reuse before GPU completion");
+        assert_eq!(p.reserve(4, 1), Some(3));
+        assert_eq!(p.place(7), 11);
+        assert_eq!(p.place(4), 3);
+        assert!(Places::new(HEAP_VIEWS, 1, 12, 2).is_none());
     }
 
     #[test]
