@@ -385,7 +385,7 @@ pub(crate) fn record_upload(
     list: &HostList,
     copy: &Arc<crate::resource::HostTexture>,
     staging: &Staging,
-    (buffer, at, subresources): &Upload,
+    upload: &Upload,
 ) -> Option<D3D12_RESOURCE_BARRIER> {
     const COPY_DEST: u32 = 0x400;
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
@@ -393,10 +393,10 @@ pub(crate) fn record_upload(
         // SAFETY: an open list; the barrier names a live texture.
         unsafe { list.list.ResourceBarrier(&[b]) };
     }
-    copies(list, &copy.texture, staging, (buffer, *at), subresources, String::new);
-    list.keep(buffer);
+    copies(list, &copy.texture, staging, upload, String::new);
+    list.keep(&upload.buffer);
     staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    staging.copied.fetch_add(upload.places.len() as u64, std::sync::atomic::Ordering::Relaxed);
     list.move_texture(copy, SHADER_RESOURCE)
 }
 
@@ -417,29 +417,29 @@ pub(crate) fn copied(resource: This) -> u64 {
 }
 
 
-/// Records the copy of `subresources` of `buffer` (laid out as `staging`
-/// says) into `texture` (in the copy destination state); `name` names it
+/// Records the copy of the upload's packed footprints into their original
+/// subresource indices of `texture` (in the copy destination state); `name` names it
 /// in diagnostics notes.
 #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
 fn copies(
     list: &HostList,
     texture: &ID3D12Resource,
     staging: &Staging,
-    (buffer, at): (&ID3D12Resource, u64),
-    subresources: &[u32],
+    upload: &Upload,
     name: impl Fn() -> String,
 ) {
-    for &i in subresources {
-        let i = i as usize;
-        let mut footprint = staging.footprints[i];
-        footprint.Offset += at;
+    let buffer = &upload.buffer;
+    for place in &upload.places {
+        let i = place.index as usize;
+        let mut footprint = place.footprint;
+        footprint.Offset += upload.at;
         let footprint = &footprint;
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
             let (gpu, d) = unsafe { (buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
+            let len = place.len as u64;
             list.note_read(
                 || {
                     format!(
@@ -451,7 +451,7 @@ fn copies(
                         d.Format.0,
                         d.MipLevels,
                         staging.footprints.len(),
-                        staging.size,
+                        upload.size,
                         footprint.Offset,
                         f.Width,
                         f.Height,
@@ -483,9 +483,61 @@ fn copies(
     }
 }
 
-/// What a refresh gives: a staging buffer, where its space starts in it,
-/// and the subresources detiled into it.
-pub(crate) type Upload = (ID3D12Resource, u64, Vec<u32>);
+/// A selected subresource's placed footprint in this upload, and its
+/// original destination index. Row pitch, format, and dimensions are
+/// copied verbatim from GetCopyableFootprints; only the offset changes.
+#[derive(Clone, Copy)]
+struct UploadPlace {
+    index: u32,
+    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    len: usize,
+}
+
+/// A staging allocation and its exact copy locations. A partial upload
+/// need not reserve memory for the other levels or array slices.
+#[derive(Clone)]
+pub(crate) struct Upload {
+    buffer: ID3D12Resource,
+    at: u64,
+    size: u64,
+    places: Vec<UploadPlace>,
+}
+
+/// Pack selected footprints at D3D12's 512-byte placement alignment.
+fn upload_places(
+    footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
+    rows: &[u32],
+    total: u64,
+    selected: &[u32],
+) -> Option<(u64, Vec<UploadPlace>)> {
+    if selected.is_empty() || footprints.len() != rows.len() || total == 0 {
+        return None;
+    }
+    // The full chain retains the driver's exact offsets and total.
+    let full = selected.len() == footprints.len()
+        && selected.iter().enumerate().all(|(i, &s)| i == s as usize);
+    let mut end = 0u64;
+    let mut places = Vec::with_capacity(selected.len());
+    for &index in selected {
+        let i = index as usize;
+        let mut footprint = *footprints.get(i)?;
+        let f = footprint.Footprint;
+        let rows = *rows.get(i)?;
+        if f.RowPitch == 0 || f.Depth == 0 || rows == 0 || footprint.Offset >= total {
+            return None;
+        }
+        let len = subresource_len(footprint.Offset, f.RowPitch as usize, rows, f.Depth, total);
+        if len == 0 {
+            return None;
+        }
+        if !full {
+            footprint.Offset = end.checked_add(511)? & !511;
+        }
+        end = footprint.Offset.checked_add(len as u64)?;
+        places.push(UploadPlace { index, footprint, len });
+    }
+    Some((if full { total } else { end }, places))
+}
 
 /// Runs `f(i)` for each `i` below `n` on up to a quarter of the CPUs (four
 /// at most: the title's own threads need the rest), here when that is
@@ -627,7 +679,7 @@ impl Staging {
             }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
-            return (bytes, buffer.map(|(b, at)| (b, at, fresh)));
+            return (bytes, buffer);
         }
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
@@ -646,7 +698,7 @@ impl Staging {
             let every = all();
             let buffer = self.detile(&zeros, &every);
             last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
-            return (0, buffer.map(|(b, at)| (b, at, every)));
+            return (0, buffer);
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
@@ -661,14 +713,15 @@ impl Staging {
         last.hash = buffer.is_some().then_some(hash);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        (size, buffer.map(|(b, at)| (b, at, every)))
+        (size, buffer)
     }
 
     /// Detiles `subresources` of `tiled` (the texture's memory) into a
     /// staging buffer (`None` if none could be had or a subresource could
     /// not be read).
-    fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<(ID3D12Resource, u64)> {
-        let (buffer, at, data) = staging_space(self.size)?;
+    fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<Upload> {
+        let (size, places) = upload_places(&self.footprints, &self.rows, self.size, subresources)?;
+        let (buffer, at, data) = staging_space(size)?;
         #[cfg(feature = "diagnostics")]
         // Scanned only when its message is wanted: a pass over every
         // texture read, in timing runs too.
@@ -683,16 +736,16 @@ impl Staging {
                 tracing::debug!(memory = ?self.memory, desc = ?self.layout.desc, "a sampled texture detiled");
             }
         }
-        for &i in subresources {
-            let (footprint, rows) = (&self.footprints[i as usize], self.rows[i as usize]);
+        for place in &places {
+            let i = place.index;
+            let (footprint, rows) = (&place.footprint, self.rows[i as usize]);
             let (mip, slice) = (i % self.mips, i / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
-            // SAFETY: `subresource_len` clamps `len` to `self.size - footprint.Offset`,
-            // keeping the slice strictly inside the mapped staging buffer even when
-            // GetCopyableFootprints does not pad the final row of the last subresource.
-            let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
+            // SAFETY: upload_places checked each offset + len against the
+            // packed allocation, preserving the original footprint's byte
+            // extent (including the unpadded final row).
+            let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), place.len) };
             if let Err(e) =
                 self.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
@@ -701,7 +754,7 @@ impl Staging {
                 return None;
             }
         }
-        Some((buffer, at))
+        Some(Upload { buffer, at, size, places })
     }
 }
 
@@ -844,6 +897,60 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_upload_packs_only_selected_levels() {
+        let footprint = |offset, width, height, pitch| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: offset,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                Width: width, Height: height, Depth: 1, RowPitch: pitch,
+            },
+        };
+        // 256x256 RGBA8 plus two smaller mips, final row not padded.
+        let f = [
+            footprint(0, 256, 256, 1024),
+            footprint(262144, 128, 128, 512),
+            footprint(327680, 64, 64, 256),
+            footprint(344064, 32, 32, 256),
+        ];
+        let rows = [256, 128, 64, 32];
+        let total = 344064 + 31 * 256 + 128;
+        let (bytes, p) = upload_places(&f, &rows, total, &[1, 3]).unwrap();
+        assert_eq!(bytes, 65536 + 31 * 256 + 128);
+        assert_eq!(p.iter().map(|p| p.index).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(p[0].footprint.Offset, 0);
+        assert_eq!(p[1].footprint.Offset, 65536);
+        assert_eq!(p[1].footprint.Footprint.RowPitch, 256);
+        assert_eq!(p[1].len, 31 * 256 + 128);
+        let (bytes, p) = upload_places(&f, &rows, total, &[0, 1, 2, 3]).unwrap();
+        assert_eq!(bytes, total);
+        assert_eq!(p[3].footprint.Offset, f[3].Offset);
+        assert!(upload_places(&f, &rows, total, &[4]).is_none());
+        assert!(upload_places(&f, &rows, total, &[]).is_none());
+    }
+
+    #[test]
+    fn packed_upload_keeps_placement_alignment_and_depth_pitch() {
+        let f = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 0,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM,
+                Width: 7, Height: 3, Depth: 3, RowPitch: 256,
+            },
+        };
+        let mut second = f;
+        second.Offset = 2560;
+        second.Footprint.Depth = 1;
+        let mut third = second;
+        third.Offset = 3584;
+        let (bytes, p) = upload_places(&[f, second, third], &[3, 3, 3], 4103, &[1, 0]).unwrap();
+        assert_eq!(p[0].len, 768);
+        assert_eq!(p[1].footprint.Offset, 1024);
+        assert_eq!(p[1].len, 2304);
+        assert_eq!(bytes, 3328);
+        assert_eq!(p[1].footprint.Footprint.Depth, 3);
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {
