@@ -1432,6 +1432,7 @@ impl Host {
         }
         // The submission has run and the next waits for our lock. Host
         // copies the title gave up meanwhile may have their last holder here.
+        crate::descriptor::host::submission_completed();
         release_retired();
         release_later(Box::new((batch, back, withheld, heaps)));
         self.log_messages();

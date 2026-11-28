@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -32,6 +32,15 @@ pub const MEMORY_SPACE: u32 = 2;
 /// indices").
 pub const HEAP_VIEWS: u32 = 1 << 21;
 pub const HEAP_SAMPLERS: u32 = 2048;
+/// The fixed physical capacity in experimental remap mode.
+pub const REMAP_PHYSICAL_VIEWS: u32 = 1_000_000;
+
+/// Process-wide opt-in. Both host allocation and translation consult the
+/// same immutable setting, including offline cache warm-up.
+pub fn view_remap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_REMAP").is_some_and(|v| v == "1"))
+}
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
 /// holds no buffer view where a shader reads one at an index it computes
@@ -545,6 +554,23 @@ impl Shader {
         let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
+        // Keep the logical index for marks, strides and read feedback;
+        // only the actual heap handle takes the physical place.
+        let physical = if !sampler && view_remap() {
+            let place = self.view_place(block, index);
+            // An unmapped place must not turn a buffer access into a
+            // texture descriptor access, even if metadata is stale.
+            if (10..=12).contains(&(props.0 & 0xff)) {
+                let missing = self.m.i32(REMAP_PHYSICAL_VIEWS - 1);
+                let null = self.m.i32(REMAP_PHYSICAL_VIEWS - 2 - u32::from(props.0 & 0x1000 != 0));
+                let absent = self.m.cmp(block, pred::EQ, place, missing);
+                self.m.select(block, absent, null, place)
+            } else {
+                place
+            }
+        } else {
+            index
+        };
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -552,7 +578,7 @@ impl Shader {
             Attr::ReadNone,
             self.t.handle,
             218,
-            &[index, s, n],
+            &[physical, s, n],
         );
         let h = self.annotate(block, h, props.0, props.1);
         // Unordered typed, raw and structured buffers (kinds 10-12), and
@@ -566,6 +592,22 @@ impl Shader {
             self.texture_index.insert(h, index);
         }
         h
+    }
+
+    /// The second half of the view-stride table holds logical-to-physical
+    /// places. Bounds are clamped in heap_handle before this root SRV load.
+    fn view_place(&mut self, block: usize, index: V) -> V {
+        let h = self.root_srv_handle(VIEW_STRIDES);
+        let four = self.m.i32(4);
+        let byte = self.m.bin(block, Bin::Mul, index, four);
+        let base = self.m.i32(HEAP_VIEWS * 4);
+        let byte = self.m.bin(block, Bin::Add, byte, base);
+        let iu = self.m.undef(self.t.i32);
+        let mask = self.m.i8(1);
+        let r = self.op(block, "rawBufferLoad.f32", Attr::ReadOnly, self.t.res_ret, 139,
+            &[h, byte, iu, mask, four]);
+        let f = self.m.extract(block, r, 0);
+        self.m.cast(block, Cast::Bitcast, f, self.t.i32)
     }
 
     /// The finished container.

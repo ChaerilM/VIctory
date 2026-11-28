@@ -807,9 +807,13 @@ impl State {
                     if kind == 1 && slot == victory_shader::emit::VIEW_STRIDES {
                         // The bound view heap's stride table; without one
                         // the shader would read an unbound root view.
-                        let heap = (self.heaps[0] != 0)
-                            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
-                            .flatten();
+                        let heap = if self.heaps[0] == 0 && memory_heap {
+                            crate::memory::heap()
+                        } else {
+                            (self.heaps[0] != 0)
+                                .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                                .flatten()
+                        };
                         let Some(table) = heap.and_then(|h| h.strides()) else {
                             once!("a shader reads view strides without a view heap: dropped");
                             not_run("view strides without a view heap");
