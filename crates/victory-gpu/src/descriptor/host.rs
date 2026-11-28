@@ -33,7 +33,7 @@ pub(crate) struct HostHeap {
     kept: Mutex<Vec<Kept>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    next: Mutex<DynamicSlots>,
     /// Slot pairs kept for host copies' views (`crate::memory`), past the
     /// dynamic slots and below the null buffer views: the next never
     /// taken, those given back, and where they end.
@@ -196,7 +196,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new(DynamicSlots::new(extra as usize)),
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
                 null if !sampler && null > count + extra && null < total => null - 1,
@@ -309,6 +309,100 @@ pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
     .as_ref()
 }
 
+/// A bit per dynamic slot. The exact free count and cursor are protected
+/// by the same heap mutex as the words. No physical wraparound allocation.
+/// Inspired by VIctory-NVIDIA #444; the cursor search preserves this
+/// tree's cross-cursor behavior.
+struct DynamicSlots {
+    words: Vec<u64>,
+    len: usize,
+    free: usize,
+    next: usize,
+}
+
+impl DynamicSlots {
+    fn new(len: usize) -> Self {
+        let mut words = vec![0; len.div_ceil(64)];
+        if len % 64 != 0 {
+            // Padding is never available for allocations.
+            *words.last_mut().expect("nonempty") = u64::MAX << (len % 64);
+        }
+        Self { words, len, free: len, next: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Option<usize> {
+        if n == 0 || n > self.free {
+            return None;
+        }
+        let second_end = self.next.saturating_add(n - 1).min(self.len);
+        let first = find_free_run(&self.words, self.next, self.len, n)
+            .or_else(|| find_free_run(&self.words, 0, second_end, n))?;
+        self.change(first, first + n, true);
+        self.next = (first + n) % self.len;
+        Some(first)
+    }
+
+    fn release(&mut self, first: usize, n: usize) {
+        let end = first.saturating_add(n).min(self.len);
+        if first < end {
+            self.change(first, end, false);
+        }
+    }
+
+    /// Set or clear a nonempty range, counting only bits that change.
+    /// Counting cleared bits also makes repeated releases idempotent.
+    fn change(&mut self, first: usize, end: usize, taken: bool) {
+        debug_assert!(first < end && end <= self.len);
+        for w in first / 64..=(end - 1) / 64 {
+            let lo = first.saturating_sub(w * 64);
+            let hi = (end - w * 64).min(64);
+            let low = u64::MAX << lo;
+            let high = if hi == 64 { u64::MAX } else { (1u64 << hi) - 1 };
+            let mask = low & high;
+            let word = &mut self.words[w];
+            let was = (*word & mask).count_ones() as usize;
+            if taken {
+                self.free -= mask.count_ones() as usize - was;
+                *word |= mask;
+            } else {
+                self.free += was;
+                *word &= !mask;
+            }
+        }
+    }
+}
+
+/// First free run wholly within [lo, hi). Whole occupied or free words
+/// advance in one iteration; mixed words are visited by runs, not bits.
+fn find_free_run(words: &[u64], lo: usize, hi: usize, n: usize) -> Option<usize> {
+    if n == 0 || lo >= hi || hi - lo < n {
+        return None;
+    }
+    let mut run = 0usize;
+    for (w, &raw) in words.iter().enumerate().take((hi - 1) / 64 + 1).skip(lo / 64) {
+        let base = w * 64;
+        let low = lo.saturating_sub(base);
+        let high = (hi - base).min(64);
+        let mut pos = low;
+        // Bits below lo or beyond hi cannot join the run.
+        while pos < high {
+            let rest = raw >> pos;
+            if rest & 1 != 0 {
+                run = 0;
+                pos += (rest.trailing_ones() as usize).min(high - pos);
+            } else {
+                let free = (rest.trailing_zeros() as usize).min(high - pos);
+                run += free;
+                pos += free;
+                if run >= n {
+                    return Some(base + pos - run);
+                }
+            }
+        }
+    }
+    None
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -316,37 +410,12 @@ impl HostHeap {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
-        let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
+        let mut slots = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(first) = slots.take(n as usize) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             return None;
         };
-        taken[first..first + n].fill(true);
-        *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
 
@@ -394,11 +463,7 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
-        }
+        self.next.lock().unwrap_or_else(|e| e.into_inner()).release(at as usize, n as usize);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -2280,6 +2345,71 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn dynamic_bitset_matches_slot_by_slot_reference() {
+        // Exercise both cursor passes, fragmentation, word boundaries,
+        // non-word-aligned lengths and duplicate/clipped releases.
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        for len in [0, 1, 7, 63, 64, 65, 127, 128, 129, 257, 1025] {
+            let mut slots = DynamicSlots::new(len);
+            let mut reference = vec![false; len];
+            let mut cursor = 0usize;
+            for _ in 0..4000 {
+                let n = random() % (len + 2);
+                if random() % 3 == 0 {
+                    let first = random() % (len + 2);
+                    let end = first.saturating_add(n).min(len);
+                    if first < end {
+                        reference[first..end].fill(false);
+                    }
+                    slots.release(first, n);
+                } else {
+                    let end = cursor.saturating_add(n.saturating_sub(1)).min(len);
+                    let expected = if n == 0 {
+                        None
+                    } else {
+                        [cursor..len, 0..end].into_iter().find_map(|range| {
+                            let stop = range.end;
+                            range.into_iter().find(|&i| i + n <= stop && reference[i..i + n].iter().all(|&b| !b))
+                        })
+                    };
+                    assert_eq!(slots.take(n), expected, "len={len}, n={n}, cursor={cursor}");
+                    if let Some(first) = expected {
+                        reference[first..first+n].fill(true);
+                        cursor = (first+n) % len;
+                    }
+                }
+                assert_eq!(slots.next, cursor);
+                assert_eq!(slots.free, reference.iter().filter(|&&b| !b).count());
+                assert!(reference.iter().enumerate().all(|(i, &b)| ((slots.words[i/64] >> (i%64)) & 1 != 0) == b));
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_bitset_rejects_padding_and_preserves_cross_word_runs() {
+        let mut slots = DynamicSlots::new(130);
+        assert_eq!(slots.take(60), Some(0));
+        assert_eq!(slots.take(65), Some(60));
+        assert_eq!(slots.take(6), None);
+        assert_eq!(slots.take(5), Some(125));
+        slots.release(61, 68);
+        slots.release(61, 68);
+        assert_eq!(slots.free, 68);
+        assert_eq!(slots.take(68), Some(61));
+        assert_eq!(slots.take(1), None);
+        slots.release(129, usize::MAX);
+        slots.release(usize::MAX, 1);
+        assert_eq!(slots.take(1), Some(129));
+        assert_eq!(slots.take(1), None);
     }
 
     #[test]
